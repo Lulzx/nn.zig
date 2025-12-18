@@ -7,15 +7,16 @@ A minimal transformer in ~1800 lines of Zig, optimized for Apple Silicon.
 Trains a character-level language model on dialog data using modern transformer architecture with multi-horizon prediction for efficient small-data learning. No frameworks, no dependencies beyond Apple's Accelerate.
 
 ```
-Step: 0     | Train: 6.56 | Val: 0.00 | W: 1.08 | TPS: 9K
-Step: 500   | Train: 2.58 | Val: 2.52 | W: 1.35 | TPS: 9K
-Sample: "Hello! How are you doing today?"
+Step: 0     | Train: 6.39 | Val: 0.00 | W: 1.00 | TPS: 17K
+Step: 2500  | Train: 1.65 | Val: 1.36 | W: 1.00 | TPS: 16K
+Step: 5000  | Train: 1.57 | Val: 1.15 | W: 1.00 | TPS: 16K
+Training complete. Best val_loss: 1.152
 ```
 
 ## Architecture
 
 ```
-Input (64 chars) → Embedding → [Layer × 3] → RMSNorm → [4 Heads] → Softmax
+Input (64 chars) → Embedding → [Layer × 4] → RMSNorm → [Fused Head] → Softmax
                                    ↓                        ↓
                     ┌──────────────────────────────┐   ┌─────────────────┐
                     │  RMSNorm → QK-Norm → Attn    │   │ Head 0: t+1     │
@@ -101,12 +102,21 @@ Improved sampling for coherent text generation:
 
 | Metric | Value |
 |--------|-------|
-| Throughput | 9K tokens/sec |
+| Throughput | 16K tokens/sec |
+| Best Val Loss | 1.15 |
 | Context | 64 characters |
-| Layers | 3 |
-| D_MODEL | 128 |
-| Parameters | ~600K |
+| Layers | 4 |
+| D_MODEL | 256 |
+| D_FFN | 1024 |
+| Batch Size | 64 |
+| Parameters | ~2M |
 | Horizons | 4 (t+1 to t+4) |
+
+**Optimizations:**
+- Fused multi-horizon projection (single GEMM)
+- Vectorized softmax using vDSP
+- Muon optimizer with Newton-Schulz orthogonalization
+- EMA weights for stable generation
 
 ## Usage
 
@@ -132,11 +142,11 @@ zig build run -Doptimize=ReleaseFast
 Edit constants in `nn.zig`:
 
 ```zig
-const D_MODEL: usize = 128;       // Embedding dimension
+const D_MODEL: usize = 256;       // Embedding dimension
 const CONTEXT: usize = 64;        // Context window size
-const D_FFN: usize = 512;         // FFN hidden dimension (4x D_MODEL)
-const N_LAYERS: usize = 3;        // Number of transformer layers
-const BATCH_SIZE: usize = 32;     // Sequences per batch
+const D_FFN: usize = 1024;        // FFN hidden dimension (4x D_MODEL)
+const N_LAYERS: usize = 4;        // Number of transformer layers
+const BATCH_SIZE: usize = 64;     // Sequences per batch
 const N_HORIZONS: usize = 4;      // Multi-horizon prediction (t+1 to t+N)
 const HORIZON_WEIGHTS: [4]f32 = .{ 1.0, 0.5, 0.25, 0.125 };
 ```

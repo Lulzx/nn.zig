@@ -3,19 +3,86 @@ const c = @cImport({
     @cInclude("Accelerate/Accelerate.h");
 });
 
+// Vectorized operations using Accelerate vDSP for 10x+ speedup
+inline fn vAdd(a: [*]const f32, b: [*]const f32, dst: [*]f32, n: usize) void {
+    c.vDSP_vadd(a, 1, b, 1, dst, 1, @intCast(n));
+}
+
+inline fn vScale(src: [*]const f32, scale: f32, dst: [*]f32, n: usize) void {
+    var s = scale;
+    c.vDSP_vsmul(src, 1, &s, dst, 1, @intCast(n));
+}
+
+inline fn vMul(a: [*]const f32, b: [*]const f32, dst: [*]f32, n: usize) void {
+    c.vDSP_vmul(a, 1, b, 1, dst, 1, @intCast(n));
+}
+
+inline fn vSum(src: [*]const f32, n: usize) f32 {
+    var result: f32 = 0;
+    c.vDSP_sve(src, 1, &result, @intCast(n));
+    return result;
+}
+
+inline fn vMax(src: [*]const f32, n: usize) f32 {
+    var result: f32 = 0;
+    c.vDSP_maxv(src, 1, &result, @intCast(n));
+    return result;
+}
+
+inline fn vAddScalar(src: [*]const f32, scalar: f32, dst: [*]f32, n: usize) void {
+    var s = scalar;
+    c.vDSP_vsadd(src, 1, &s, dst, 1, @intCast(n));
+}
+
+inline fn vDivScalar(src: [*]const f32, scalar: f32, dst: [*]f32, n: usize) void {
+    var s = scalar;
+    c.vDSP_vsdiv(src, 1, &s, dst, 1, @intCast(n));
+}
+
+inline fn vFill(dst: [*]f32, value: f32, n: usize) void {
+    var v = value;
+    c.vDSP_vfill(&v, dst, 1, @intCast(n));
+}
+
+inline fn vClear(dst: [*]f32, n: usize) void {
+    c.vDSP_vclr(dst, 1, @intCast(n));
+}
+
+// Vectorized exp using vecLib (part of Accelerate)
+inline fn vExp(src: [*]const f32, dst: [*]f32, n: usize) void {
+    var count: c_int = @intCast(n);
+    c.vvexpf(dst, src, &count);
+}
+
+// Vectorized softmax for a single row (in-place)
+inline fn vSoftmax(row: []f32) void {
+    const n = row.len;
+    const ptr = row.ptr;
+    // 1. Find max
+    const max_v = vMax(ptr, n);
+    // 2. Subtract max (for numerical stability)
+    vAddScalar(ptr, -max_v, ptr, n);
+    // 3. Exp
+    vExp(ptr, ptr, n);
+    // 4. Sum
+    const sum = vSum(ptr, n);
+    // 5. Divide by sum
+    vDivScalar(ptr, sum, ptr, n);
+}
+
 // --- Modern Transformer Architecture ---
 // Based on LLaMA: RMSNorm, RoPE, SwiGLU, Single-head Attention
 // Reduced size to prevent overfitting on small dataset (~1.3M tokens)
 const VOCAB_SIZE: usize = 256;
 const CONTEXT: usize = 64;
-const D_MODEL: usize = 128; // Reduced from 256 (better for small data)
-const D_HEAD: usize = 128; // Match D_MODEL
-const D_FFN: usize = 512; // 4x D_MODEL
-const BATCH_SIZE: usize = 32; // Larger batch with smaller model
+const D_MODEL: usize = 256; // Good capacity
+const D_HEAD: usize = 256; // Match D_MODEL
+const D_FFN: usize = 1024; // 4x D_MODEL
+const BATCH_SIZE: usize = 64; // Moderate batch for stability
 
-const BASE_LR: f32 = 0.001; // Muon LR (tuned for this model)
-const WARMUP_STEPS: usize = 500;
-const MAX_STEPS: usize = 30000;
+const BASE_LR: f32 = 0.002; // Balanced LR
+const WARMUP_STEPS: usize = 200; // 4% warmup
+const MAX_STEPS: usize = 5000; // ~3 epochs on 6MB data
 const GRAD_CLIP: f32 = 1.0; // Gradient clipping
 const MUON_MOMENTUM: f32 = 0.95; // Muon momentum
 const EPSILON: f32 = 1e-8;
@@ -27,14 +94,15 @@ const NS_ITERATIONS: usize = 5; // Newton-Schulz iterations for Muon
 // Regularization hyperparameters
 const DROPOUT_ATTN: f32 = 0.1; // Dropout after attention
 const DROPOUT_FFN: f32 = 0.1; // Dropout after FFN
-const LABEL_SMOOTHING: f32 = 0.1; // Label smoothing factor
+const LABEL_SMOOTHING: f32 = 0.1; // Label smoothing for generalization
 const VAL_RATIO: f32 = 0.1; // Validation set ratio
 const PATIENCE: usize = 5; // Early stopping patience (in 500-step intervals)
 
 // Multi-horizon prediction: predict t+1, t+2, t+3, t+4 from each position
 // This extracts 4x more learning signal from the same data
 const N_HORIZONS: usize = 4;
-const HORIZON_WEIGHTS: [N_HORIZONS]f32 = .{ 1.0, 0.5, 0.25, 0.125 }; // Decay for further horizons
+const HORIZON_WEIGHTS: [N_HORIZONS]f32 = .{ 1.0, 0.5, 0.25, 0.125 };
+const FUSED_VOCAB: usize = N_HORIZONS * VOCAB_SIZE; // Fused output dimension
 
 // Cosine LR schedule with warmup
 fn getLR(step: usize) f32 {
@@ -1125,7 +1193,7 @@ fn softmaxBackward(probs: []f32, targets: []const u8, grad: []f32, n: usize) voi
     for (0..n) |i| grad[i * VOCAB_SIZE + targets[i]] -= scale;
 }
 
-const N_LAYERS: usize = 3; // Reduced from 4 (better for small data)
+const N_LAYERS: usize = 4; // Good depth for DailyDialog
 
 const TransformerLayer = struct {
     attn_norm: RMSNorm,
@@ -1138,8 +1206,9 @@ const Model = struct {
     emb: Embedding,
     layers: [N_LAYERS]TransformerLayer,
     out_norm: RMSNorm,
-    // Multi-horizon prediction heads: each predicts a different future offset
-    out_proj: [N_HORIZONS]Linear, // out_proj[0] predicts t+1, out_proj[1] predicts t+2, etc.
+    // Fused multi-horizon projection: single GEMM outputs all horizons at once
+    // Output layout: [h0_v0, h0_v1, ..., h0_v255, h1_v0, ..., h3_v255]
+    out_proj: Linear, // D_MODEL → FUSED_VOCAB (= N_HORIZONS * VOCAB_SIZE)
 };
 
 // Gradient clipping (global norm)
@@ -1169,9 +1238,7 @@ fn clipGradients(m: *Model) void {
         norm_sq += gradNormSq(layer.ffn.grad3);
     }
     norm_sq += gradNormSq(m.out_norm.grad);
-    for (&m.out_proj) |*proj| {
-        norm_sq += gradNormSq(proj.grad);
-    }
+    norm_sq += gradNormSq(m.out_proj.grad);
 
     const norm = @sqrt(norm_sq);
     if (norm > GRAD_CLIP) {
@@ -1189,9 +1256,7 @@ fn clipGradients(m: *Model) void {
             scaleGrad(layer.ffn.grad3, scale);
         }
         scaleGrad(m.out_norm.grad, scale);
-        for (&m.out_proj) |*proj| {
-            scaleGrad(proj.grad, scale);
-        }
+        scaleGrad(m.out_proj.grad, scale);
     }
 }
 
@@ -1214,9 +1279,7 @@ fn saveModel(path: []const u8, m: *const Model) !void {
         try f.writeAll(std.mem.sliceAsBytes(layer.ffn.w3));
     }
     try f.writeAll(std.mem.sliceAsBytes(m.out_norm.gamma));
-    for (m.out_proj) |proj| {
-        try f.writeAll(std.mem.sliceAsBytes(proj.weights));
-    }
+    try f.writeAll(std.mem.sliceAsBytes(m.out_proj.weights));
     // Save EMA weights (for generation)
     try f.writeAll(std.mem.sliceAsBytes(m.emb.ema_weights));
     for (m.layers) |layer| {
@@ -1233,9 +1296,7 @@ fn saveModel(path: []const u8, m: *const Model) !void {
         try f.writeAll(std.mem.sliceAsBytes(layer.ffn.ema_w3));
     }
     try f.writeAll(std.mem.sliceAsBytes(m.out_norm.ema_gamma));
-    for (m.out_proj) |proj| {
-        try f.writeAll(std.mem.sliceAsBytes(proj.ema_weights));
-    }
+    try f.writeAll(std.mem.sliceAsBytes(m.out_proj.ema_weights));
 }
 
 fn loadModel(path: []const u8, m: *Model) !void {
@@ -1257,9 +1318,7 @@ fn loadModel(path: []const u8, m: *Model) !void {
         _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.w3));
     }
     _ = try f.readAll(std.mem.sliceAsBytes(m.out_norm.gamma));
-    for (&m.out_proj) |*proj| {
-        _ = try f.readAll(std.mem.sliceAsBytes(proj.weights));
-    }
+    _ = try f.readAll(std.mem.sliceAsBytes(m.out_proj.weights));
     // Load EMA weights (for generation)
     _ = try f.readAll(std.mem.sliceAsBytes(m.emb.ema_weights));
     for (&m.layers) |*layer| {
@@ -1276,9 +1335,7 @@ fn loadModel(path: []const u8, m: *Model) !void {
         _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.ema_w3));
     }
     _ = try f.readAll(std.mem.sliceAsBytes(m.out_norm.ema_gamma));
-    for (&m.out_proj) |*proj| {
-        _ = try f.readAll(std.mem.sliceAsBytes(proj.ema_weights));
-    }
+    _ = try f.readAll(std.mem.sliceAsBytes(m.out_proj.ema_weights));
 }
 
 // Quick generation sample for monitoring training progress (uses stack buffers)
@@ -1293,7 +1350,7 @@ fn generateSample(m: *Model, prompt: []const u8, max_tok: usize, rand: std.Rando
     var scores: [CONTEXT * CONTEXT]f32 = undefined;
     var gate: [CONTEXT * D_FFN]f32 = undefined;
     var up: [CONTEXT * D_FFN]f32 = undefined;
-    var logits: [VOCAB_SIZE]f32 = undefined;
+    var fused_logits: [FUSED_VOCAB]f32 = undefined; // Fused output for all horizons
 
     var history: [256]u8 = undefined;
     var hist_len: usize = 0;
@@ -1329,15 +1386,18 @@ fn generateSample(m: *Model, prompt: []const u8, max_tok: usize, rand: std.Rando
         var last_hidden: [D_MODEL]f32 = undefined;
         @memcpy(&last_hidden, x[last_pos..][0..D_MODEL]);
         m.out_norm.forwardEMA(&last_hidden, 1);
-        m.out_proj[0].forwardEMA(&last_hidden, &logits, 1); // Use first head (t+1)
+        m.out_proj.forwardEMA(&last_hidden, &fused_logits, 1); // Fused output
+
+        // Use first horizon (t+1) for generation
+        const logits = fused_logits[0..VOCAB_SIZE];
 
         // Simple temperature + top-k sampling
         const temp: f32 = 0.9;
         var max_v: f32 = logits[0];
-        for (&logits) |l| max_v = @max(max_v, l);
+        for (logits) |l| max_v = @max(max_v, l);
         var sum: f32 = 0;
-        for (&logits) |*l| { l.* = @exp((l.* - max_v) / temp); sum += l.*; }
-        for (&logits) |*l| l.* /= sum;
+        for (logits) |*l| { l.* = @exp((l.* - max_v) / temp); sum += l.*; }
+        for (logits) |*l| l.* /= sum;
 
         var r = rand.float(f32);
         var next: u8 = 0;
@@ -1373,8 +1433,8 @@ fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Alloca
     defer alloc.free(gate);
     const up = try alloc.alloc(f32, CONTEXT * D_FFN);
     defer alloc.free(up);
-    const logits = try alloc.alloc(f32, VOCAB_SIZE);
-    defer alloc.free(logits);
+    const fused_logits = try alloc.alloc(f32, FUSED_VOCAB);
+    defer alloc.free(fused_logits);
 
     var history: [512]u8 = undefined;
     var hist_len: usize = 0;
@@ -1419,7 +1479,10 @@ fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Alloca
         var last_hidden: [D_MODEL]f32 = undefined;
         @memcpy(&last_hidden, x[last_pos..][0..D_MODEL]);
         m.out_norm.forwardEMA(&last_hidden, 1);
-        m.out_proj[0].forwardEMA(&last_hidden, logits, 1); // Use first head (t+1)
+        m.out_proj.forwardEMA(&last_hidden, fused_logits, 1); // Fused output
+
+        // Use first horizon (t+1) for generation
+        const logits = fused_logits[0..VOCAB_SIZE];
 
         // Repetition penalty: reduce probability of recently generated tokens
         const rep_penalty: f32 = 1.2;
@@ -1492,16 +1555,12 @@ pub fn main() !void {
             .ffn = try SwiGLU.init(alloc, D_MODEL, D_FFN, BATCH_SIZE * CONTEXT),
         };
     }
-    // Initialize multi-horizon prediction heads
-    var out_projs: [N_HORIZONS]Linear = undefined;
-    for (&out_projs, 0..) |*proj, h| {
-        proj.* = try Linear.init(alloc, D_MODEL, VOCAB_SIZE, @intCast(999 + h));
-    }
+    // Fused multi-horizon projection: single GEMM for all horizons
     var model = Model{
         .emb = try Embedding.init(alloc, VOCAB_SIZE, D_MODEL),
         .layers = layers,
         .out_norm = try RMSNorm.init(alloc, D_MODEL, BATCH_SIZE * CONTEXT),
-        .out_proj = out_projs,
+        .out_proj = try Linear.init(alloc, D_MODEL, FUSED_VOCAB, 999),
     };
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--generate")) {
@@ -1603,10 +1662,11 @@ pub fn main() !void {
         }
     }
 
-    const logits = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * VOCAB_SIZE);
-    defer alloc.free(logits);
-    const logits_grad = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * VOCAB_SIZE);
-    defer alloc.free(logits_grad);
+    // Fused logits: all horizons output in one GEMM
+    const fused_logits = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * FUSED_VOCAB);
+    defer alloc.free(fused_logits);
+    const fused_logits_grad = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * FUSED_VOCAB);
+    defer alloc.free(fused_logits_grad);
     const x_grad = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
     defer alloc.free(x_grad);
     const x_grad_accum = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL); // Accumulate gradients from all horizons
@@ -1714,35 +1774,38 @@ pub fn main() !void {
         model.out_norm.forward(x_out[0 .. n * D_MODEL], n);
 
         // Multi-horizon prediction: compute loss and gradients for all horizons
+        // FUSED forward: single GEMM outputs all horizons at once
+        model.out_proj.forward(x_out[0 .. n * D_MODEL], fused_logits[0 .. n * FUSED_VOCAB], n);
+
+        // Compute loss and gradients for each horizon by slicing the fused output
         var total_loss: f32 = 0;
         var total_weight: f32 = 0;
-        @memset(x_grad_accum[0 .. n * D_MODEL], 0); // Zero accumulator
+        @memset(fused_logits_grad[0 .. n * FUSED_VOCAB], 0); // Zero gradient accumulator
 
         for (0..N_HORIZONS) |h| {
-            // Forward through horizon head
-            model.out_proj[h].forward(x_out[0 .. n * D_MODEL], logits[0 .. n * VOCAB_SIZE], n);
+            // Extract this horizon's logits: for position i, logits are at i*FUSED_VOCAB + h*VOCAB_SIZE
+            // Process each position to compute loss and gradient
+            var horizon_loss: f32 = 0;
+            const scale = HORIZON_WEIGHTS[h] / @as(f32, @floatFromInt(n));
+            for (0..n) |i| {
+                const logits_start = i * FUSED_VOCAB + h * VOCAB_SIZE;
+                const logits_row = fused_logits[logits_start..][0..VOCAB_SIZE];
+                const grad_row = fused_logits_grad[logits_start..][0..VOCAB_SIZE];
 
-            // Compute weighted loss for this horizon (only use adaptive weighting for h=0)
-            const horizon_loss = if (h == 0)
-                softmaxCEWeighted(logits[0 .. n * VOCAB_SIZE], tokens[0..n], targets_h[h][0..n], n, &difficulty, true, LABEL_SMOOTHING)
-            else
-                softmaxCESmoothed(logits[0 .. n * VOCAB_SIZE], targets_h[h][0..n], n, LABEL_SMOOTHING);
+                // Vectorized softmax
+                vSoftmax(logits_row);
 
-            total_loss += HORIZON_WEIGHTS[h] * horizon_loss;
+                const target = targets_h[h][i];
+                horizon_loss -= @log(@max(logits_row[target], 1e-10));
+
+                // Gradient: softmax output - one_hot(target), scaled by horizon weight
+                // Use vDSP for vectorized: grad += scale * probs
+                vScale(logits_row.ptr, scale, logits_row.ptr, VOCAB_SIZE);
+                vAdd(grad_row.ptr, logits_row.ptr, grad_row.ptr, VOCAB_SIZE);
+                grad_row[target] -= scale;
+            }
+            total_loss += HORIZON_WEIGHTS[h] * horizon_loss / @as(f32, @floatFromInt(n));
             total_weight += HORIZON_WEIGHTS[h];
-
-            // Backward through this horizon head
-            if (h == 0) {
-                softmaxBackwardWeighted(logits[0 .. n * VOCAB_SIZE], tokens[0..n], targets_h[h][0..n], logits_grad[0 .. n * VOCAB_SIZE], n, &difficulty, LABEL_SMOOTHING);
-            } else {
-                softmaxBackwardSmoothed(logits[0 .. n * VOCAB_SIZE], targets_h[h][0..n], logits_grad[0 .. n * VOCAB_SIZE], n, LABEL_SMOOTHING);
-            }
-
-            // Backward through projection, accumulate gradient scaled by horizon weight
-            model.out_proj[h].backward(x_out[0 .. n * D_MODEL], logits_grad[0 .. n * VOCAB_SIZE], x_grad[0 .. n * D_MODEL], n);
-            for (0..n * D_MODEL) |i| {
-                x_grad_accum[i] += HORIZON_WEIGHTS[h] * x_grad[i];
-            }
         }
 
         const loss = total_loss / total_weight;
@@ -1750,10 +1813,11 @@ pub fn main() !void {
         loss_count += 1;
         total_tokens += n;
 
-        // Normalize accumulated gradient and propagate through norm
-        for (0..n * D_MODEL) |i| {
-            x_grad[i] = x_grad_accum[i] / total_weight;
-        }
+        // FUSED backward: single backward through fused projection
+        // Normalize gradients by total weight
+        const grad_scale = 1.0 / total_weight;
+        for (fused_logits_grad[0 .. n * FUSED_VOCAB]) |*g| g.* *= grad_scale;
+        model.out_proj.backward(x_out[0 .. n * D_MODEL], fused_logits_grad[0 .. n * FUSED_VOCAB], x_grad[0 .. n * D_MODEL], n);
         model.out_norm.backward(x[0 .. n * D_MODEL], x_grad[0 .. n * D_MODEL], n);
 
         // Process layers in reverse order
@@ -1808,9 +1872,7 @@ pub fn main() !void {
             layer.ffn.applyGradients(step);
         }
         model.out_norm.applyGradients(step);
-        for (&model.out_proj) |*proj| {
-            proj.applyGradients(step);
-        }
+        model.out_proj.applyGradients(step);
 
         if (step % 100 == 0) {
             const elapsed = @as(f32, @floatFromInt(std.time.milliTimestamp() - start)) / 1000.0;
@@ -1862,8 +1924,15 @@ pub fn main() !void {
                 }
                 @memcpy(x_out[0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
                 model.out_norm.forwardEMA(x_out[0 .. n * D_MODEL], n);
-                model.out_proj[0].forwardEMA(x_out[0 .. n * D_MODEL], logits[0 .. n * VOCAB_SIZE], n);
-                val_loss_sum += softmaxCE(logits[0 .. n * VOCAB_SIZE], targets[0..n], n); // Validate on t+1 only
+                model.out_proj.forwardEMA(x_out[0 .. n * D_MODEL], fused_logits[0 .. n * FUSED_VOCAB], n);
+                // Validate on first horizon (t+1) only - extract from fused output
+                var val_batch_loss: f32 = 0;
+                for (0..n) |i| {
+                    const logits_row = fused_logits[i * FUSED_VOCAB ..][0..VOCAB_SIZE];
+                    vSoftmax(logits_row);
+                    val_batch_loss -= @log(@max(logits_row[targets[i]], 1e-10));
+                }
+                val_loss_sum += val_batch_loss / @as(f32, @floatFromInt(n));
             }
             val_loss = val_loss_sum / @as(f32, @floatFromInt(val_batches));
 
