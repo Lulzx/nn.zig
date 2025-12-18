@@ -288,12 +288,13 @@ pub const Embedding = struct {
         return .{ .weights = w, .m = m, .v = v, .grad = g, .vocab = vocab, .dim = dim };
     }
 
-    // Gather CONTEXT tokens into concatenated output
+    // Gather CONTEXT tokens into concatenated output (positions before target)
     pub fn gatherContext(self: *const Embedding, data: []const u8, offsets: []const usize, output: []f32, batch: usize) void {
         for (0..batch) |b| {
             const base = offsets[b];
             for (0..CONTEXT) |ctx| {
-                const tok = if (base >= CONTEXT - ctx) data[base - (CONTEXT - 1 - ctx)] else 0;
+                // Use positions [base-CONTEXT, base-1] to predict target at base
+                const tok = if (base > CONTEXT - 1 - ctx) data[base - CONTEXT + ctx] else 0;
                 const src = self.weights[@as(usize, tok) * self.dim ..][0..self.dim];
                 const dst = output[(b * CONTEXT + ctx) * self.dim ..][0..self.dim];
                 @memcpy(dst, src);
@@ -305,7 +306,7 @@ pub const Embedding = struct {
         for (0..batch) |b| {
             const base = offsets[b];
             for (0..CONTEXT) |ctx| {
-                const tok = if (base >= CONTEXT - ctx) data[base - (CONTEXT - 1 - ctx)] else 0;
+                const tok = if (base > CONTEXT - 1 - ctx) data[base - CONTEXT + ctx] else 0;
                 const src = in_grad[(b * CONTEXT + ctx) * self.dim ..][0..self.dim];
                 const dst = self.grad[@as(usize, tok) * self.dim ..][0..self.dim];
                 c.vDSP_vadd(dst.ptr, 1, src.ptr, 1, dst.ptr, 1, @intCast(self.dim));
@@ -350,22 +351,26 @@ fn softmaxBackward(probs: []f32, targets: []const u8, grad: []f32, batch: usize)
     for (0..batch) |b| grad[b * VOCAB_SIZE + targets[b]] -= scale;
 }
 
-fn saveModel(path: []const u8, emb: *const Embedding, fc1: *const Linear, fc2: *const Linear) !void {
+fn saveModel(path: []const u8, emb: *const Embedding, fc1: *const Linear, ln: *const LayerNorm, fc2: *const Linear) !void {
     const f = try std.fs.cwd().createFile(path, .{});
     defer f.close();
     try f.writeAll(std.mem.sliceAsBytes(emb.weights));
     try f.writeAll(std.mem.sliceAsBytes(fc1.weights));
     try f.writeAll(std.mem.sliceAsBytes(fc1.bias));
+    try f.writeAll(std.mem.sliceAsBytes(ln.gamma));
+    try f.writeAll(std.mem.sliceAsBytes(ln.beta));
     try f.writeAll(std.mem.sliceAsBytes(fc2.weights));
     try f.writeAll(std.mem.sliceAsBytes(fc2.bias));
 }
 
-fn loadModel(path: []const u8, emb: *Embedding, fc1: *Linear, fc2: *Linear) !void {
+fn loadModel(path: []const u8, emb: *Embedding, fc1: *Linear, ln: *LayerNorm, fc2: *Linear) !void {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
     _ = try f.readAll(std.mem.sliceAsBytes(emb.weights));
     _ = try f.readAll(std.mem.sliceAsBytes(fc1.weights));
     _ = try f.readAll(std.mem.sliceAsBytes(fc1.bias));
+    _ = try f.readAll(std.mem.sliceAsBytes(ln.gamma));
+    _ = try f.readAll(std.mem.sliceAsBytes(ln.beta));
     _ = try f.readAll(std.mem.sliceAsBytes(fc2.weights));
     _ = try f.readAll(std.mem.sliceAsBytes(fc2.bias));
 }
@@ -394,9 +399,9 @@ fn generate(emb: *const Embedding, fc1: *const Linear, ln: *LayerNorm, fc2: *con
     std.debug.print("\n{s}", .{prompt});
 
     for (0..max_tok) |_| {
-        // Build context from history
+        // Build context from history: use [hist_len-CONTEXT, hist_len-1] to predict next
         for (0..CONTEXT) |ctx| {
-            const idx = if (hist_len >= CONTEXT - ctx) hist_len - (CONTEXT - 1 - ctx) - 1 else 0;
+            const idx = if (hist_len > CONTEXT - 1 - ctx) hist_len - CONTEXT + ctx else 0;
             const tok = if (idx < hist_len) history[idx] else 0;
             const src = emb.weights[@as(usize, tok) * D_MODEL ..][0..D_MODEL];
             const dst = input[ctx * D_MODEL ..][0..D_MODEL];
@@ -412,12 +417,22 @@ fn generate(emb: *const Embedding, fc1: *const Linear, ln: *LayerNorm, fc2: *con
         var max_v: f32 = logits[0];
         for (logits) |l| max_v = @max(max_v, l);
         var sum: f32 = 0;
-        for (logits) |*l| { l.* = @exp((l.* - max_v) / 0.7); sum += l.*; }
+        const temp: f32 = 0.8;
+        for (logits) |*l| {
+            l.* = @exp((l.* - max_v) / temp);
+            sum += l.*;
+        }
         for (logits) |*l| l.* /= sum;
 
         var r = prng.random().float(f32);
         var next: u8 = 0;
-        for (logits, 0..) |p, i| { r -= p; if (r <= 0) { next = @intCast(i); break; } }
+        for (logits, 0..) |p, i| {
+            r -= p;
+            if (r <= 0) {
+                next = @intCast(i);
+                break;
+            }
+        }
 
         if (next >= 32 and next < 127) std.debug.print("{c}", .{next})
         else if (next == '\n') std.debug.print("\n", .{});
@@ -442,7 +457,7 @@ pub fn main() !void {
     var fc2 = try Linear.init(alloc, D_HIDDEN, VOCAB_SIZE, 456);
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--generate")) {
-        loadModel("model.bin", &emb, &fc1, &fc2) catch {
+        loadModel("model.bin", &emb, &fc1, &ln, &fc2) catch {
             std.debug.print("Error: model.bin not found\n", .{});
             return;
         };
@@ -486,11 +501,15 @@ pub fn main() !void {
     var loss_sum: f32 = 0;
     var loss_count: usize = 0;
 
+    // Random position sampling for better generalization
+    var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
+    const rand = prng.random();
+
     var step: usize = 0;
-    while (step < 1000) : (step += 1) {
-        // Sample batch positions (need at least CONTEXT chars before)
+    while (step < 5000) : (step += 1) {
+        // Sample random batch positions (need at least CONTEXT chars before)
         for (0..BATCH_SIZE) |i| {
-            const pos = CONTEXT + ((step * BATCH_SIZE + i) * 17) % (size - CONTEXT - 1);
+            const pos = CONTEXT + rand.uintLessThan(usize, size - CONTEXT - 1);
             offsets[i] = pos;
             targets[i] = data[pos];
         }
@@ -532,6 +551,6 @@ pub fn main() !void {
         }
     }
 
-    try saveModel("model.bin", &emb, &fc1, &fc2);
+    try saveModel("model.bin", &emb, &fc1, &ln, &fc2);
     std.debug.print("\nTraining complete.\n", .{});
 }
