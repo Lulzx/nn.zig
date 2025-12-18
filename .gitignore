@@ -1,0 +1,12 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+
+# Data files
+*.txt
+*.tar.gz
+*.zip
+data/
+
+# Model files
+*.bin
