@@ -1,39 +1,51 @@
 # nn.zig
 
-A minimal neural network in ~600 lines of Zig, optimized for Apple Silicon.
+A minimal transformer in ~1000 lines of Zig, optimized for Apple Silicon.
 
 ## What it does
 
-Trains a character-level language model on dialog data. No frameworks, no dependencies beyond Apple's Accelerate.
+Trains a character-level language model on dialog data using modern transformer architecture. No frameworks, no dependencies beyond Apple's Accelerate.
 
 ```
-Step: 0   | Loss: 5.872 | TPS: 8K
-Step: 500 | Loss: 0.247 | TPS: 10K
-Step: 900 | Loss: 0.029 | TPS: 10K
+Step: 0     | Loss: 6.433 | TPS: 64K
+Step: 10000 | Loss: 2.131 | TPS: 95K
+Step: 20000 | Loss: 2.064 | TPS: 96K
 ```
 
 ## Architecture
 
 ```
-Input (8 chars) → Embedding → FC1 → LayerNorm → GELU → FC2 → Softmax
-     ↓              ↓                                        ↓
-  "How are "    [1024-dim]                              P(next char)
+Input (64 chars) → Embedding → [Layer × 2] → RMSNorm → Linear → Softmax
+                                   ↓
+                    ┌──────────────────────────────┐
+                    │  RMSNorm → Self-Attention    │
+                    │      ↓         (RoPE)        │
+                    │  + Residual                  │
+                    │      ↓                       │
+                    │  RMSNorm → SwiGLU FFN        │
+                    │      ↓                       │
+                    │  + Residual                  │
+                    └──────────────────────────────┘
 ```
 
-- **8-token context**: Concatenates embeddings from 8 previous characters
-- **GELU activation**: Smoother gradients than ReLU
-- **Layer Normalization**: Stabilizes training
-- **Adam optimizer**: With linear warmup
+Modern LLaMA-style architecture:
+- **RMSNorm**: Simpler and faster than LayerNorm
+- **RoPE**: Rotary Position Embeddings for position encoding
+- **SwiGLU**: Gated activation from LLaMA/PaLM (`SiLU(xW₁) ⊙ xW₂`)
+- **Causal Self-Attention**: Single-head with causal masking
+- **AdamW**: With weight decay and cosine LR schedule
+- **Gradient Clipping**: Global norm clipping for stability
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Throughput | 10K tokens/sec |
-| Final loss | ~0.03 @ 1K steps |
-| Memory | ~50MB |
+| Throughput | 96K tokens/sec |
+| Final loss | ~2.0 @ 20K steps |
+| Context | 64 characters |
+| Layers | 2 |
 
-Speed comes from GEMM batching—processing 128 tokens as a single matrix multiplication via `cblas_sgemm`.
+Speed comes from GEMM batching—processing sequences as matrix multiplications via `cblas_sgemm`.
 
 ## Usage
 
@@ -43,6 +55,9 @@ python3 fetch_data.py
 
 # Train
 zig build run -Doptimize=ReleaseFast
+
+# Generate text (after training)
+zig build run -Doptimize=ReleaseFast -- --generate "A: Hello"
 ```
 
 ## Requirements
@@ -56,11 +71,13 @@ zig build run -Doptimize=ReleaseFast
 Edit constants in `nn.zig`:
 
 ```zig
-const D_MODEL: usize = 128;      // Embedding dimension per token
-const CONTEXT: usize = 8;        // Context window size
-const D_HIDDEN: usize = 2048;    // Hidden layer size
-const BATCH_SIZE: usize = 128;   // Tokens per batch
-const BASE_LR: f32 = 0.001;      // Learning rate
+const D_MODEL: usize = 128;      // Embedding dimension
+const CONTEXT: usize = 64;       // Context window size
+const D_FFN: usize = 512;        // FFN hidden dimension
+const N_LAYERS: usize = 2;       // Number of transformer layers
+const BATCH_SIZE: usize = 32;    // Sequences per batch
+const BASE_LR: f32 = 0.0006;     // Peak learning rate
+const MAX_STEPS: usize = 20000;  // Training steps
 ```
 
 ## License

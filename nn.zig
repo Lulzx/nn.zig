@@ -3,265 +3,492 @@ const c = @cImport({
     @cInclude("Accelerate/Accelerate.h");
 });
 
-// --- Hyperparameters ---
+// --- Modern Transformer Architecture ---
+// Based on LLaMA: RMSNorm, RoPE, SwiGLU, Single-head Attention
 const VOCAB_SIZE: usize = 256;
-const D_MODEL: usize = 128; // Per-token embedding
-const CONTEXT: usize = 8; // Look at 8 previous tokens
-const D_INPUT: usize = D_MODEL * CONTEXT; // 1024 total input dim
-const D_HIDDEN: usize = 2048; // Larger hidden layer
-const BATCH_SIZE: usize = 128;
+const CONTEXT: usize = 64;
+const D_MODEL: usize = 128; // 2x larger embedding
+const D_HEAD: usize = 128; // Match D_MODEL
+const D_FFN: usize = 512; // 4x D_MODEL (LLaMA ratio)
+const BATCH_SIZE: usize = 32; // Smaller batch for larger model
 
-const BASE_LR: f32 = 0.001;
-const WARMUP_STEPS: usize = 50;
+const BASE_LR: f32 = 0.0006; // Higher LR for faster convergence
+const WARMUP_STEPS: usize = 200;
+const MAX_STEPS: usize = 20000;
+const GRAD_CLIP: f32 = 1.0; // Gradient clipping
 const BETA1: f32 = 0.9;
-const BETA2: f32 = 0.999;
+const BETA2: f32 = 0.95; // LLaMA uses 0.95
 const EPSILON: f32 = 1e-8;
+const WEIGHT_DECAY: f32 = 0.1; // AdamW weight decay
 
+// Cosine LR schedule with warmup
 fn getLR(step: usize) f32 {
     if (step < WARMUP_STEPS) {
         return BASE_LR * @as(f32, @floatFromInt(step + 1)) / @as(f32, WARMUP_STEPS);
     }
-    return BASE_LR;
+    const progress = @as(f32, @floatFromInt(step - WARMUP_STEPS)) / @as(f32, @floatFromInt(MAX_STEPS - WARMUP_STEPS));
+    return BASE_LR * 0.5 * (1.0 + @cos(std.math.pi * progress));
 }
 
-// GELU activation (smoother than ReLU, better gradients)
-fn gelu(x: []f32) void {
-    const sqrt_2_over_pi: f32 = 0.7978845608;
-    const coeff: f32 = 0.044715;
-
-    for (x) |*val| {
-        const v = val.*;
-        // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        const inner = sqrt_2_over_pi * (v + coeff * v * v * v);
-        val.* = 0.5 * v * (1.0 + std.math.tanh(inner));
-    }
-}
-
-fn geluBackward(output: []const f32, input: []const f32, grad: []f32) void {
-    const sqrt_2_over_pi: f32 = 0.7978845608;
-    const coeff: f32 = 0.044715;
-
-    for (grad, output, input) |*g, _, x| {
-        const x3 = x * x * x;
-        const inner = sqrt_2_over_pi * (x + coeff * x3);
-        const tanh_inner = std.math.tanh(inner);
-        const sech2 = 1.0 - tanh_inner * tanh_inner;
-        const d_inner = sqrt_2_over_pi * (1.0 + 3.0 * coeff * x * x);
-
-        // d/dx GELU = 0.5 * (1 + tanh) + 0.5 * x * sech^2 * d_inner
-        const d_gelu = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * d_inner;
-        g.* *= d_gelu;
-    }
-}
-
-// Layer Normalization (stabilizes training)
-const LayerNorm = struct {
+// RMSNorm (LLaMA) - simpler and faster than LayerNorm
+const RMSNorm = struct {
     gamma: []f32,
-    beta: []f32,
     dim: usize,
     // Adam state
-    m_gamma: []f32,
-    v_gamma: []f32,
-    m_beta: []f32,
-    v_beta: []f32,
-    grad_gamma: []f32,
-    grad_beta: []f32,
-    // Cache for backward
-    mean: []f32,
+    m: []f32,
+    v: []f32,
+    grad: []f32,
+    // Cache
     rstd: []f32,
 
-    pub fn init(alloc: std.mem.Allocator, dim: usize, batch: usize) !LayerNorm {
+    pub fn init(alloc: std.mem.Allocator, dim: usize, max_batch: usize) !RMSNorm {
         const gamma = try alloc.alloc(f32, dim);
-        const beta = try alloc.alloc(f32, dim);
         for (gamma) |*g| g.* = 1.0;
-        @memset(beta, 0);
 
         return .{
             .gamma = gamma,
-            .beta = beta,
             .dim = dim,
-            .m_gamma = try alloc.alloc(f32, dim),
-            .v_gamma = try alloc.alloc(f32, dim),
-            .m_beta = try alloc.alloc(f32, dim),
-            .v_beta = try alloc.alloc(f32, dim),
-            .grad_gamma = try alloc.alloc(f32, dim),
-            .grad_beta = try alloc.alloc(f32, dim),
-            .mean = try alloc.alloc(f32, batch),
-            .rstd = try alloc.alloc(f32, batch),
+            .m = try alloc.alloc(f32, dim),
+            .v = try alloc.alloc(f32, dim),
+            .grad = try alloc.alloc(f32, dim),
+            .rstd = try alloc.alloc(f32, max_batch * CONTEXT),
         };
     }
 
-    pub fn forward(self: *LayerNorm, x: []f32, batch: usize) void {
-        const eps: f32 = 1e-5;
+    pub fn forward(self: *RMSNorm, x: []f32, n: usize) void {
+        const eps: f32 = 1e-6;
+        for (0..n) |i| {
+            const row = x[i * self.dim ..][0..self.dim];
+            var ss: f32 = 0;
+            for (row) |v| ss += v * v;
+            const rstd = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(self.dim)) + eps);
+            self.rstd[i] = rstd;
+            for (row, 0..) |*v, j| v.* = v.* * rstd * self.gamma[j];
+        }
+    }
 
-        for (0..batch) |b| {
-            const row = x[b * self.dim ..][0..self.dim];
+    pub fn backward(self: *RMSNorm, x: []const f32, grad: []f32, n: usize) void {
+        for (0..n) |i| {
+            const grad_row = grad[i * self.dim ..][0..self.dim];
+            const x_row = x[i * self.dim ..][0..self.dim];
+            const rstd = self.rstd[i];
 
-            // Compute mean
-            var sum: f32 = 0;
-            for (row) |v| sum += v;
-            const mean = sum / @as(f32, @floatFromInt(self.dim));
-            self.mean[b] = mean;
-
-            // Compute variance
-            var var_sum: f32 = 0;
-            for (row) |v| {
-                const d = v - mean;
-                var_sum += d * d;
+            // Accumulate gamma gradients
+            for (0..self.dim) |j| {
+                self.grad[j] += grad_row[j] * x_row[j] * rstd;
             }
-            const variance = var_sum / @as(f32, @floatFromInt(self.dim));
-            const rstd = 1.0 / @sqrt(variance + eps);
-            self.rstd[b] = rstd;
 
-            // Normalize and scale
-            for (row, 0..) |*v, i| {
-                v.* = (v.* - mean) * rstd * self.gamma[i] + self.beta[i];
+            // Input gradient for RMSNorm
+            var dot: f32 = 0;
+            for (0..self.dim) |j| {
+                dot += grad_row[j] * self.gamma[j] * x_row[j];
+            }
+            const scale = rstd * rstd * rstd / @as(f32, @floatFromInt(self.dim));
+            for (0..self.dim) |j| {
+                grad_row[j] = rstd * self.gamma[j] * grad_row[j] - scale * dot * x_row[j];
             }
         }
     }
 
-    pub fn backward(self: *LayerNorm, x: []const f32, grad: []f32, batch: usize) void {
-        const dim_f = @as(f32, @floatFromInt(self.dim));
-
-        for (0..batch) |b| {
-            const grad_row = grad[b * self.dim ..][0..self.dim];
-            const x_row = x[b * self.dim ..][0..self.dim];
-            const mean = self.mean[b];
-            const rstd = self.rstd[b];
-
-            // Accumulate gamma/beta gradients
-            for (0..self.dim) |i| {
-                const x_norm = (x_row[i] - mean) * rstd;
-                self.grad_gamma[i] += grad_row[i] * x_norm;
-                self.grad_beta[i] += grad_row[i];
-            }
-
-            // Compute input gradient
-            var sum_grad: f32 = 0;
-            var sum_grad_x: f32 = 0;
-            for (0..self.dim) |i| {
-                sum_grad += grad_row[i] * self.gamma[i];
-                sum_grad_x += grad_row[i] * self.gamma[i] * (x_row[i] - mean);
-            }
-
-            for (0..self.dim) |i| {
-                const x_norm = (x_row[i] - mean) * rstd;
-                grad_row[i] = rstd * self.gamma[i] * (grad_row[i] - sum_grad / dim_f - x_norm * sum_grad_x * rstd * rstd / dim_f);
-            }
-        }
-    }
-
-    pub fn applyGradients(self: *LayerNorm, step: usize) void {
+    pub fn applyGradients(self: *RMSNorm, step: usize) void {
         const lr = getLR(step);
         const t = @as(f32, @floatFromInt(step + 1));
         const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
         const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
 
         for (0..self.dim) |i| {
-            // Gamma
-            var g = self.grad_gamma[i];
-            self.m_gamma[i] = BETA1 * self.m_gamma[i] + (1 - BETA1) * g;
-            self.v_gamma[i] = BETA2 * self.v_gamma[i] + (1 - BETA2) * g * g;
-            self.gamma[i] -= lr * (self.m_gamma[i] / bc1) / (@sqrt(self.v_gamma[i] / bc2) + EPSILON);
-
-            // Beta
-            g = self.grad_beta[i];
-            self.m_beta[i] = BETA1 * self.m_beta[i] + (1 - BETA1) * g;
-            self.v_beta[i] = BETA2 * self.v_beta[i] + (1 - BETA2) * g * g;
-            self.beta[i] -= lr * (self.m_beta[i] / bc1) / (@sqrt(self.v_beta[i] / bc2) + EPSILON);
+            const g = self.grad[i];
+            self.m[i] = BETA1 * self.m[i] + (1 - BETA1) * g;
+            self.v[i] = BETA2 * self.v[i] + (1 - BETA2) * g * g;
+            self.gamma[i] -= lr * (self.m[i] / bc1) / (@sqrt(self.v[i] / bc2) + EPSILON);
         }
-
-        @memset(self.grad_gamma, 0);
-        @memset(self.grad_beta, 0);
+        @memset(self.grad, 0);
     }
 };
 
-pub const Linear = struct {
-    weights: []f32,
-    bias: []f32,
-    in_dim: usize,
-    out_dim: usize,
-    m_w: []f32,
-    v_w: []f32,
-    m_b: []f32,
-    v_b: []f32,
-    grad_w: []f32,
-    grad_b: []f32,
+// Single-head Self-Attention with RoPE
+const Attention = struct {
+    wq: []f32,
+    wk: []f32,
+    wv: []f32,
+    wo: []f32,
+    dim: usize,
+    // Adam state for each weight matrix
+    m_q: []f32, v_q: []f32, grad_q: []f32,
+    m_k: []f32, v_k: []f32, grad_k: []f32,
+    m_v: []f32, v_v: []f32, grad_v: []f32,
+    m_o: []f32, v_o: []f32, grad_o: []f32,
+    // RoPE cache
+    cos_cache: []f32,
+    sin_cache: []f32,
 
-    pub fn init(alloc: std.mem.Allocator, in_d: usize, out_d: usize, seed: u64) !Linear {
-        const w = try alloc.alloc(f32, out_d * in_d);
-        const b = try alloc.alloc(f32, out_d);
+    pub fn init(alloc: std.mem.Allocator, dim: usize) !Attention {
+        const size = dim * dim;
+        var prng = std.Random.DefaultPrng.init(789);
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dim)));
 
-        var prng = std.Random.DefaultPrng.init(seed);
-        const scale = @sqrt(2.0 / @as(f32, @floatFromInt(in_d)));
-        for (w) |*val| val.* = prng.random().floatNorm(f32) * scale;
-        @memset(b, 0);
+        const wq = try alloc.alloc(f32, size);
+        const wk = try alloc.alloc(f32, size);
+        const wv = try alloc.alloc(f32, size);
+        const wo = try alloc.alloc(f32, size);
+        for (wq) |*w| w.* = prng.random().floatNorm(f32) * scale;
+        for (wk) |*w| w.* = prng.random().floatNorm(f32) * scale;
+        for (wv) |*w| w.* = prng.random().floatNorm(f32) * scale;
+        for (wo) |*w| w.* = prng.random().floatNorm(f32) * scale;
+
+        // Precompute RoPE frequencies
+        const cos_cache = try alloc.alloc(f32, CONTEXT * dim / 2);
+        const sin_cache = try alloc.alloc(f32, CONTEXT * dim / 2);
+        for (0..CONTEXT) |pos| {
+            for (0..dim / 2) |i| {
+                const freq = 1.0 / std.math.pow(f32, 10000.0, @as(f32, @floatFromInt(2 * i)) / @as(f32, @floatFromInt(dim)));
+                const angle = @as(f32, @floatFromInt(pos)) * freq;
+                cos_cache[pos * dim / 2 + i] = @cos(angle);
+                sin_cache[pos * dim / 2 + i] = @sin(angle);
+            }
+        }
 
         return .{
-            .weights = w, .bias = b, .in_dim = in_d, .out_dim = out_d,
-            .m_w = try alloc.alloc(f32, out_d * in_d),
-            .v_w = try alloc.alloc(f32, out_d * in_d),
-            .m_b = try alloc.alloc(f32, out_d),
-            .v_b = try alloc.alloc(f32, out_d),
-            .grad_w = try alloc.alloc(f32, out_d * in_d),
-            .grad_b = try alloc.alloc(f32, out_d),
+            .wq = wq, .wk = wk, .wv = wv, .wo = wo, .dim = dim,
+            .m_q = try alloc.alloc(f32, size), .v_q = try alloc.alloc(f32, size), .grad_q = try alloc.alloc(f32, size),
+            .m_k = try alloc.alloc(f32, size), .v_k = try alloc.alloc(f32, size), .grad_k = try alloc.alloc(f32, size),
+            .m_v = try alloc.alloc(f32, size), .v_v = try alloc.alloc(f32, size), .grad_v = try alloc.alloc(f32, size),
+            .m_o = try alloc.alloc(f32, size), .v_o = try alloc.alloc(f32, size), .grad_o = try alloc.alloc(f32, size),
+            .cos_cache = cos_cache, .sin_cache = sin_cache,
         };
     }
 
-    pub fn forward(self: *const Linear, input: []const f32, output: []f32, batch: usize) void {
-        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
-            @intCast(batch), @intCast(self.out_dim), @intCast(self.in_dim),
-            1.0, input.ptr, @intCast(self.in_dim), self.weights.ptr, @intCast(self.in_dim),
-            0.0, output.ptr, @intCast(self.out_dim));
-
-        for (0..batch) |b| {
-            const row = output[b * self.out_dim ..][0..self.out_dim];
-            c.vDSP_vadd(row.ptr, 1, self.bias.ptr, 1, row.ptr, 1, @intCast(self.out_dim));
+    fn applyRoPE(self: *const Attention, x: []f32, seq_len: usize) void {
+        for (0..seq_len) |pos| {
+            const row = x[pos * self.dim ..][0..self.dim];
+            for (0..self.dim / 2) |i| {
+                const cos_val = self.cos_cache[pos * self.dim / 2 + i];
+                const sin_val = self.sin_cache[pos * self.dim / 2 + i];
+                const x0 = row[2 * i];
+                const x1 = row[2 * i + 1];
+                row[2 * i] = x0 * cos_val - x1 * sin_val;
+                row[2 * i + 1] = x0 * sin_val + x1 * cos_val;
+            }
         }
     }
 
-    pub fn backward(self: *Linear, input: []const f32, out_grad: []const f32, in_grad: []f32, batch: usize) void {
+    fn applyRoPEBackward(self: *const Attention, grad: []f32, seq_len: usize) void {
+        for (0..seq_len) |pos| {
+            const row = grad[pos * self.dim ..][0..self.dim];
+            for (0..self.dim / 2) |i| {
+                const cos_val = self.cos_cache[pos * self.dim / 2 + i];
+                const sin_val = self.sin_cache[pos * self.dim / 2 + i];
+                const g0 = row[2 * i];
+                const g1 = row[2 * i + 1];
+                // Transpose of rotation matrix
+                row[2 * i] = g0 * cos_val + g1 * sin_val;
+                row[2 * i + 1] = -g0 * sin_val + g1 * cos_val;
+            }
+        }
+    }
+
+    pub fn forward(self: *const Attention, x: []const f32, output: []f32, q: []f32, k: []f32, v: []f32, scores: []f32, seq_len: usize) void {
+        const d = self.dim;
+
+        // Q, K, V projections
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, x.ptr, @intCast(d), self.wq.ptr, @intCast(d), 0.0, q.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, x.ptr, @intCast(d), self.wk.ptr, @intCast(d), 0.0, k.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, x.ptr, @intCast(d), self.wv.ptr, @intCast(d), 0.0, v.ptr, @intCast(d));
+
+        // Apply RoPE to Q and K
+        self.applyRoPE(q, seq_len);
+        self.applyRoPE(k, seq_len);
+
+        // Attention scores: Q @ K^T / sqrt(d)
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(seq_len), @intCast(d),
+            scale, q.ptr, @intCast(d), k.ptr, @intCast(d), 0.0, scores.ptr, @intCast(seq_len));
+
+        // Causal mask + softmax
+        for (0..seq_len) |i| {
+            const row = scores[i * seq_len ..][0..seq_len];
+            // Causal: mask future positions
+            for (i + 1..seq_len) |j| row[j] = -1e9;
+            // Softmax
+            var max_v: f32 = row[0];
+            for (row[0..i + 1]) |s| max_v = @max(max_v, s);
+            var sum: f32 = 0;
+            for (row[0..i + 1]) |*s| { s.* = @exp(s.* - max_v); sum += s.*; }
+            for (row[0..i + 1]) |*s| s.* /= sum;
+            for (i + 1..seq_len) |j| row[j] = 0;
+        }
+
+        // Output: scores @ V
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(seq_len),
+            1.0, scores.ptr, @intCast(seq_len), v.ptr, @intCast(d), 0.0, output.ptr, @intCast(d));
+
+        // Output projection
+        const temp = output[0 .. seq_len * d];
+        var temp_copy: [CONTEXT * D_HEAD]f32 = undefined;
+        @memcpy(temp_copy[0..seq_len * d], temp);
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, &temp_copy, @intCast(d), self.wo.ptr, @intCast(d), 0.0, output.ptr, @intCast(d));
+    }
+
+    pub fn backward(self: *Attention, x: []const f32, out_grad: []const f32, in_grad: []f32,
+                    q: []f32, k: []f32, v: []f32, scores: []const f32, seq_len: usize) void {
+        const d = self.dim;
+
+        // Gradient through output projection
+        var attn_out_grad: [CONTEXT * D_HEAD]f32 = undefined;
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, out_grad.ptr, @intCast(d), self.wo.ptr, @intCast(d), 0.0, &attn_out_grad, @intCast(d));
+
+        // Accumulate Wo gradient
+        var attn_out: [CONTEXT * D_HEAD]f32 = undefined;
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(seq_len),
+            1.0, scores.ptr, @intCast(seq_len), v.ptr, @intCast(d), 0.0, &attn_out, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(d), @intCast(d), @intCast(seq_len),
+            1.0, out_grad.ptr, @intCast(d), &attn_out, @intCast(d), 1.0, self.grad_o.ptr, @intCast(d));
+
+        // Gradient through attention
+        var scores_grad: [CONTEXT * CONTEXT]f32 = undefined;
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(seq_len), @intCast(d),
+            1.0, &attn_out_grad, @intCast(d), v.ptr, @intCast(d), 0.0, &scores_grad, @intCast(seq_len));
+
+        var v_grad: [CONTEXT * D_HEAD]f32 = undefined;
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(seq_len),
+            1.0, scores.ptr, @intCast(seq_len), &attn_out_grad, @intCast(d), 0.0, &v_grad, @intCast(d));
+
+        // Softmax backward
+        for (0..seq_len) |i| {
+            const s_row = scores[i * seq_len ..][0..seq_len];
+            const g_row = scores_grad[i * seq_len ..][0..seq_len];
+            var dot: f32 = 0;
+            for (0..i + 1) |j| dot += s_row[j] * g_row[j];
+            for (0..i + 1) |j| g_row[j] = s_row[j] * (g_row[j] - dot);
+            for (i + 1..seq_len) |j| g_row[j] = 0;
+        }
+
+        // Gradient through Q @ K^T
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+        var q_grad: [CONTEXT * D_HEAD]f32 = undefined;
+        var k_grad: [CONTEXT * D_HEAD]f32 = undefined;
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(seq_len),
+            scale, &scores_grad, @intCast(seq_len), k.ptr, @intCast(d), 0.0, &q_grad, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(seq_len),
+            scale, &scores_grad, @intCast(seq_len), q.ptr, @intCast(d), 0.0, &k_grad, @intCast(d));
+
+        // RoPE backward
+        self.applyRoPEBackward(&q_grad, seq_len);
+        self.applyRoPEBackward(&k_grad, seq_len);
+
+        // Accumulate Q, K, V weight gradients
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(d), @intCast(d), @intCast(seq_len),
+            1.0, &q_grad, @intCast(d), x.ptr, @intCast(d), 1.0, self.grad_q.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(d), @intCast(d), @intCast(seq_len),
+            1.0, &k_grad, @intCast(d), x.ptr, @intCast(d), 1.0, self.grad_k.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(d), @intCast(d), @intCast(seq_len),
+            1.0, &v_grad, @intCast(d), x.ptr, @intCast(d), 1.0, self.grad_v.ptr, @intCast(d));
+
         // Input gradient
         c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
-            @intCast(batch), @intCast(self.in_dim), @intCast(self.out_dim),
-            1.0, out_grad.ptr, @intCast(self.out_dim), self.weights.ptr, @intCast(self.in_dim),
-            0.0, in_grad.ptr, @intCast(self.in_dim));
-
-        // Weight gradient
-        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
-            @intCast(self.out_dim), @intCast(self.in_dim), @intCast(batch),
-            1.0, out_grad.ptr, @intCast(self.out_dim), input.ptr, @intCast(self.in_dim),
-            1.0, self.grad_w.ptr, @intCast(self.in_dim));
-
-        // Bias gradient
-        for (0..batch) |b| {
-            const row = out_grad[b * self.out_dim ..][0..self.out_dim];
-            c.vDSP_vadd(self.grad_b.ptr, 1, row.ptr, 1, self.grad_b.ptr, 1, @intCast(self.out_dim));
-        }
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, &q_grad, @intCast(d), self.wq.ptr, @intCast(d), 0.0, in_grad.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, &k_grad, @intCast(d), self.wk.ptr, @intCast(d), 1.0, in_grad.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, &v_grad, @intCast(d), self.wv.ptr, @intCast(d), 1.0, in_grad.ptr, @intCast(d));
     }
 
-    pub fn applyGradients(self: *Linear, step: usize) void {
+    pub fn applyGradients(self: *Attention, step: usize) void {
+        const lr = getLR(step);
+        const t = @as(f32, @floatFromInt(step + 1));
+        const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
+        const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
+        const size = self.dim * self.dim;
+
+        inline for (.{
+            .{ self.wq, self.m_q, self.v_q, self.grad_q },
+            .{ self.wk, self.m_k, self.v_k, self.grad_k },
+            .{ self.wv, self.m_v, self.v_v, self.grad_v },
+            .{ self.wo, self.m_o, self.v_o, self.grad_o },
+        }) |params| {
+            const w = params[0];
+            const m = params[1];
+            const vv = params[2];
+            const grad = params[3];
+            for (0..size) |i| {
+                const g = grad[i] + WEIGHT_DECAY * w[i];
+                m[i] = BETA1 * m[i] + (1 - BETA1) * g;
+                vv[i] = BETA2 * vv[i] + (1 - BETA2) * g * g;
+                w[i] -= lr * (m[i] / bc1) / (@sqrt(vv[i] / bc2) + EPSILON);
+            }
+            @memset(grad, 0);
+        }
+    }
+};
+
+// SwiGLU FFN (LLaMA/PaLM) - better than GELU
+const SwiGLU = struct {
+    w1: []f32, // gate projection
+    w2: []f32, // up projection
+    w3: []f32, // down projection
+    in_dim: usize,
+    hidden_dim: usize,
+    // Adam state
+    m1: []f32, v1: []f32, grad1: []f32,
+    m2: []f32, v2: []f32, grad2: []f32,
+    m3: []f32, v3: []f32, grad3: []f32,
+    // Temp buffers for backward
+    hidden_buf: []f32,
+    gate_grad_buf: []f32,
+    up_grad_buf: []f32,
+
+    pub fn init(alloc: std.mem.Allocator, in_d: usize, hidden_d: usize, max_n: usize) !SwiGLU {
+        var prng = std.Random.DefaultPrng.init(321);
+        const scale = @sqrt(2.0 / @as(f32, @floatFromInt(in_d)));
+
+        const w1 = try alloc.alloc(f32, hidden_d * in_d);
+        const w2 = try alloc.alloc(f32, hidden_d * in_d);
+        const w3 = try alloc.alloc(f32, in_d * hidden_d);
+        for (w1) |*w| w.* = prng.random().floatNorm(f32) * scale;
+        for (w2) |*w| w.* = prng.random().floatNorm(f32) * scale;
+        for (w3) |*w| w.* = prng.random().floatNorm(f32) * scale;
+
+        return .{
+            .w1 = w1, .w2 = w2, .w3 = w3,
+            .in_dim = in_d, .hidden_dim = hidden_d,
+            .m1 = try alloc.alloc(f32, hidden_d * in_d),
+            .v1 = try alloc.alloc(f32, hidden_d * in_d),
+            .grad1 = try alloc.alloc(f32, hidden_d * in_d),
+            .m2 = try alloc.alloc(f32, hidden_d * in_d),
+            .v2 = try alloc.alloc(f32, hidden_d * in_d),
+            .grad2 = try alloc.alloc(f32, hidden_d * in_d),
+            .m3 = try alloc.alloc(f32, in_d * hidden_d),
+            .v3 = try alloc.alloc(f32, in_d * hidden_d),
+            .grad3 = try alloc.alloc(f32, in_d * hidden_d),
+            .hidden_buf = try alloc.alloc(f32, max_n * hidden_d),
+            .gate_grad_buf = try alloc.alloc(f32, max_n * hidden_d),
+            .up_grad_buf = try alloc.alloc(f32, max_n * hidden_d),
+        };
+    }
+
+    pub fn forward(self: *const SwiGLU, x: []const f32, output: []f32, gate: []f32, up: []f32, n: usize) void {
+        // gate = x @ W1, up = x @ W2
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.hidden_dim), @intCast(self.in_dim),
+            1.0, x.ptr, @intCast(self.in_dim), self.w1.ptr, @intCast(self.in_dim),
+            0.0, gate.ptr, @intCast(self.hidden_dim));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.hidden_dim), @intCast(self.in_dim),
+            1.0, x.ptr, @intCast(self.in_dim), self.w2.ptr, @intCast(self.in_dim),
+            0.0, up.ptr, @intCast(self.hidden_dim));
+
+        // SwiGLU: silu(gate) * up
+        for (0..n * self.hidden_dim) |i| {
+            const g = gate[i];
+            const silu = g / (1.0 + @exp(-g)); // SiLU = x * sigmoid(x)
+            gate[i] = silu * up[i];
+        }
+
+        // output = hidden @ W3
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.in_dim), @intCast(self.hidden_dim),
+            1.0, gate.ptr, @intCast(self.hidden_dim), self.w3.ptr, @intCast(self.hidden_dim),
+            0.0, output.ptr, @intCast(self.in_dim));
+    }
+
+    pub fn backward(self: *SwiGLU, x: []const f32, out_grad: []const f32, in_grad: []f32,
+                    gate_pre: []const f32, up: []const f32, gate: []f32, n: usize) void {
+        // Gradient through W3
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(n), @intCast(self.hidden_dim), @intCast(self.in_dim),
+            1.0, out_grad.ptr, @intCast(self.in_dim), self.w3.ptr, @intCast(self.hidden_dim),
+            0.0, gate.ptr, @intCast(self.hidden_dim));
+
+        // Accumulate W3 gradient (need hidden state = silu(gate) * up)
+        for (0..n * self.hidden_dim) |i| {
+            const g = gate_pre[i];
+            const silu = g / (1.0 + @exp(-g));
+            self.hidden_buf[i] = silu * up[i];
+        }
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(self.in_dim), @intCast(self.hidden_dim), @intCast(n),
+            1.0, out_grad.ptr, @intCast(self.in_dim), self.hidden_buf.ptr, @intCast(self.hidden_dim),
+            1.0, self.grad3.ptr, @intCast(self.hidden_dim));
+
+        // Gradient through SwiGLU
+        for (0..n * self.hidden_dim) |i| {
+            const g = gate_pre[i];
+            const sig = 1.0 / (1.0 + @exp(-g));
+            const silu = g * sig;
+            const silu_grad = sig * (1.0 + g * (1.0 - sig));
+            self.gate_grad_buf[i] = gate[i] * up[i] * silu_grad;
+            self.up_grad_buf[i] = gate[i] * silu;
+        }
+
+        // Accumulate W1, W2 gradients
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(self.hidden_dim), @intCast(self.in_dim), @intCast(n),
+            1.0, self.gate_grad_buf.ptr, @intCast(self.hidden_dim), x.ptr, @intCast(self.in_dim),
+            1.0, self.grad1.ptr, @intCast(self.in_dim));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(self.hidden_dim), @intCast(self.in_dim), @intCast(n),
+            1.0, self.up_grad_buf.ptr, @intCast(self.hidden_dim), x.ptr, @intCast(self.in_dim),
+            1.0, self.grad2.ptr, @intCast(self.in_dim));
+
+        // Input gradient
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(n), @intCast(self.in_dim), @intCast(self.hidden_dim),
+            1.0, self.gate_grad_buf.ptr, @intCast(self.hidden_dim), self.w1.ptr, @intCast(self.in_dim),
+            0.0, in_grad.ptr, @intCast(self.in_dim));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(n), @intCast(self.in_dim), @intCast(self.hidden_dim),
+            1.0, self.up_grad_buf.ptr, @intCast(self.hidden_dim), self.w2.ptr, @intCast(self.in_dim),
+            1.0, in_grad.ptr, @intCast(self.in_dim));
+    }
+
+    pub fn applyGradients(self: *SwiGLU, step: usize) void {
         const lr = getLR(step);
         const t = @as(f32, @floatFromInt(step + 1));
         const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
         const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
 
-        const wc = self.in_dim * self.out_dim;
-        for (0..wc) |i| {
-            const g = self.grad_w[i];
-            self.m_w[i] = BETA1 * self.m_w[i] + (1 - BETA1) * g;
-            self.v_w[i] = BETA2 * self.v_w[i] + (1 - BETA2) * g * g;
-            self.weights[i] -= lr * (self.m_w[i] / bc1) / (@sqrt(self.v_w[i] / bc2) + EPSILON);
+        inline for (.{
+            .{ self.w1, self.m1, self.v1, self.grad1, self.hidden_dim * self.in_dim },
+            .{ self.w2, self.m2, self.v2, self.grad2, self.hidden_dim * self.in_dim },
+            .{ self.w3, self.m3, self.v3, self.grad3, self.in_dim * self.hidden_dim },
+        }) |params| {
+            const w = params[0];
+            const m = params[1];
+            const vv = params[2];
+            const grad = params[3];
+            const size = params[4];
+            for (0..size) |i| {
+                const g = grad[i] + WEIGHT_DECAY * w[i];
+                m[i] = BETA1 * m[i] + (1 - BETA1) * g;
+                vv[i] = BETA2 * vv[i] + (1 - BETA2) * g * g;
+                w[i] -= lr * (m[i] / bc1) / (@sqrt(vv[i] / bc2) + EPSILON);
+            }
+            @memset(grad, 0);
         }
-        for (0..self.out_dim) |i| {
-            const g = self.grad_b[i];
-            self.m_b[i] = BETA1 * self.m_b[i] + (1 - BETA1) * g;
-            self.v_b[i] = BETA2 * self.v_b[i] + (1 - BETA2) * g * g;
-            self.bias[i] -= lr * (self.m_b[i] / bc1) / (@sqrt(self.v_b[i] / bc2) + EPSILON);
-        }
-
-        @memset(self.grad_w, 0);
-        @memset(self.grad_b, 0);
     }
 };
 
@@ -279,38 +506,28 @@ pub const Embedding = struct {
         for (w) |*val| val.* = prng.random().floatNorm(f32) * 0.02;
 
         const m = try alloc.alloc(f32, vocab * dim);
-        const v = try alloc.alloc(f32, vocab * dim);
+        const vv = try alloc.alloc(f32, vocab * dim);
         const g = try alloc.alloc(f32, vocab * dim);
         @memset(m, 0);
-        @memset(v, 0);
+        @memset(vv, 0);
         @memset(g, 0);
 
-        return .{ .weights = w, .m = m, .v = v, .grad = g, .vocab = vocab, .dim = dim };
+        return .{ .weights = w, .m = m, .v = vv, .grad = g, .vocab = vocab, .dim = dim };
     }
 
-    // Gather CONTEXT tokens into concatenated output (positions before target)
-    pub fn gatherContext(self: *const Embedding, data: []const u8, offsets: []const usize, output: []f32, batch: usize) void {
-        for (0..batch) |b| {
-            const base = offsets[b];
-            for (0..CONTEXT) |ctx| {
-                // Use positions [base-CONTEXT, base-1] to predict target at base
-                const tok = if (base > CONTEXT - 1 - ctx) data[base - CONTEXT + ctx] else 0;
-                const src = self.weights[@as(usize, tok) * self.dim ..][0..self.dim];
-                const dst = output[(b * CONTEXT + ctx) * self.dim ..][0..self.dim];
-                @memcpy(dst, src);
-            }
+    pub fn gather(self: *const Embedding, tokens: []const u8, output: []f32) void {
+        for (tokens, 0..) |tok, i| {
+            const src = self.weights[@as(usize, tok) * self.dim ..][0..self.dim];
+            const dst = output[i * self.dim ..][0..self.dim];
+            @memcpy(dst, src);
         }
     }
 
-    pub fn accumulateGrad(self: *Embedding, data: []const u8, offsets: []const usize, in_grad: []const f32, batch: usize) void {
-        for (0..batch) |b| {
-            const base = offsets[b];
-            for (0..CONTEXT) |ctx| {
-                const tok = if (base > CONTEXT - 1 - ctx) data[base - CONTEXT + ctx] else 0;
-                const src = in_grad[(b * CONTEXT + ctx) * self.dim ..][0..self.dim];
-                const dst = self.grad[@as(usize, tok) * self.dim ..][0..self.dim];
-                c.vDSP_vadd(dst.ptr, 1, src.ptr, 1, dst.ptr, 1, @intCast(self.dim));
-            }
+    pub fn accumulateGrad(self: *Embedding, tokens: []const u8, in_grad: []const f32) void {
+        for (tokens, 0..) |tok, i| {
+            const src = in_grad[i * self.dim ..][0..self.dim];
+            const dst = self.grad[@as(usize, tok) * self.dim ..][0..self.dim];
+            c.vDSP_vadd(dst.ptr, 1, src.ptr, 1, dst.ptr, 1, @intCast(self.dim));
         }
     }
 
@@ -330,67 +547,217 @@ pub const Embedding = struct {
     }
 };
 
-fn softmaxCE(logits: []f32, targets: []const u8, batch: usize) f32 {
+// Output projection (tied with embedding for efficiency)
+pub const Linear = struct {
+    weights: []f32,
+    in_dim: usize,
+    out_dim: usize,
+    m: []f32,
+    v: []f32,
+    grad: []f32,
+
+    pub fn init(alloc: std.mem.Allocator, in_d: usize, out_d: usize, seed: u64) !Linear {
+        const w = try alloc.alloc(f32, out_d * in_d);
+        var prng = std.Random.DefaultPrng.init(seed);
+        const scale = @sqrt(2.0 / @as(f32, @floatFromInt(in_d)));
+        for (w) |*val| val.* = prng.random().floatNorm(f32) * scale;
+
+        return .{
+            .weights = w, .in_dim = in_d, .out_dim = out_d,
+            .m = try alloc.alloc(f32, out_d * in_d),
+            .v = try alloc.alloc(f32, out_d * in_d),
+            .grad = try alloc.alloc(f32, out_d * in_d),
+        };
+    }
+
+    pub fn forward(self: *const Linear, input: []const f32, output: []f32, n: usize) void {
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.out_dim), @intCast(self.in_dim),
+            1.0, input.ptr, @intCast(self.in_dim), self.weights.ptr, @intCast(self.in_dim),
+            0.0, output.ptr, @intCast(self.out_dim));
+    }
+
+    pub fn backward(self: *Linear, input: []const f32, out_grad: []const f32, in_grad: []f32, n: usize) void {
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(n), @intCast(self.in_dim), @intCast(self.out_dim),
+            1.0, out_grad.ptr, @intCast(self.out_dim), self.weights.ptr, @intCast(self.in_dim),
+            0.0, in_grad.ptr, @intCast(self.in_dim));
+
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(self.out_dim), @intCast(self.in_dim), @intCast(n),
+            1.0, out_grad.ptr, @intCast(self.out_dim), input.ptr, @intCast(self.in_dim),
+            1.0, self.grad.ptr, @intCast(self.in_dim));
+    }
+
+    pub fn applyGradients(self: *Linear, step: usize) void {
+        const lr = getLR(step);
+        const t = @as(f32, @floatFromInt(step + 1));
+        const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
+        const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
+        const size = self.in_dim * self.out_dim;
+
+        for (0..size) |i| {
+            const g = self.grad[i] + WEIGHT_DECAY * self.weights[i];
+            self.m[i] = BETA1 * self.m[i] + (1 - BETA1) * g;
+            self.v[i] = BETA2 * self.v[i] + (1 - BETA2) * g * g;
+            self.weights[i] -= lr * (self.m[i] / bc1) / (@sqrt(self.v[i] / bc2) + EPSILON);
+        }
+        @memset(self.grad, 0);
+    }
+};
+
+fn softmaxCE(logits: []f32, targets: []const u8, n: usize) f32 {
     var loss: f32 = 0;
-    for (0..batch) |b| {
-        const row = logits[b * VOCAB_SIZE ..][0..VOCAB_SIZE];
+    for (0..n) |i| {
+        const row = logits[i * VOCAB_SIZE ..][0..VOCAB_SIZE];
         var max_v: f32 = row[0];
         for (row) |l| max_v = @max(max_v, l);
         var sum: f32 = 0;
         for (row) |*l| { l.* = @exp(l.* - max_v); sum += l.*; }
         for (row) |*l| l.* /= sum;
-        loss -= @log(@max(row[targets[b]], 1e-10));
+        loss -= @log(@max(row[targets[i]], 1e-10));
     }
-    return loss / @as(f32, @floatFromInt(batch));
+    return loss / @as(f32, @floatFromInt(n));
 }
 
-fn softmaxBackward(probs: []f32, targets: []const u8, grad: []f32, batch: usize) void {
+fn softmaxBackward(probs: []f32, targets: []const u8, grad: []f32, n: usize) void {
     @memcpy(grad, probs);
-    const scale = 1.0 / @as(f32, @floatFromInt(batch));
-    c.cblas_sscal(@intCast(batch * VOCAB_SIZE), scale, grad.ptr, 1);
-    for (0..batch) |b| grad[b * VOCAB_SIZE + targets[b]] -= scale;
+    const scale = 1.0 / @as(f32, @floatFromInt(n));
+    c.cblas_sscal(@intCast(n * VOCAB_SIZE), scale, grad.ptr, 1);
+    for (0..n) |i| grad[i * VOCAB_SIZE + targets[i]] -= scale;
 }
 
-fn saveModel(path: []const u8, emb: *const Embedding, fc1: *const Linear, ln: *const LayerNorm, fc2: *const Linear) !void {
+const N_LAYERS: usize = 2;
+
+const TransformerLayer = struct {
+    attn_norm: RMSNorm,
+    attn: Attention,
+    ffn_norm: RMSNorm,
+    ffn: SwiGLU,
+};
+
+const Model = struct {
+    emb: Embedding,
+    layers: [N_LAYERS]TransformerLayer,
+    out_norm: RMSNorm,
+    out_proj: Linear,
+};
+
+// Gradient clipping (global norm)
+fn gradNormSq(grad: []const f32) f32 {
+    var sum: f32 = 0;
+    for (grad) |g| sum += g * g;
+    return sum;
+}
+
+fn scaleGrad(grad: []f32, scale: f32) void {
+    for (grad) |*g| g.* *= scale;
+}
+
+fn clipGradients(m: *Model) void {
+    // Compute global gradient norm
+    var norm_sq: f32 = 0;
+    norm_sq += gradNormSq(m.emb.grad);
+    for (&m.layers) |*layer| {
+        norm_sq += gradNormSq(layer.attn_norm.grad);
+        norm_sq += gradNormSq(layer.attn.grad_q);
+        norm_sq += gradNormSq(layer.attn.grad_k);
+        norm_sq += gradNormSq(layer.attn.grad_v);
+        norm_sq += gradNormSq(layer.attn.grad_o);
+        norm_sq += gradNormSq(layer.ffn_norm.grad);
+        norm_sq += gradNormSq(layer.ffn.grad1);
+        norm_sq += gradNormSq(layer.ffn.grad2);
+        norm_sq += gradNormSq(layer.ffn.grad3);
+    }
+    norm_sq += gradNormSq(m.out_norm.grad);
+    norm_sq += gradNormSq(m.out_proj.grad);
+
+    const norm = @sqrt(norm_sq);
+    if (norm > GRAD_CLIP) {
+        const scale = GRAD_CLIP / norm;
+        scaleGrad(m.emb.grad, scale);
+        for (&m.layers) |*layer| {
+            scaleGrad(layer.attn_norm.grad, scale);
+            scaleGrad(layer.attn.grad_q, scale);
+            scaleGrad(layer.attn.grad_k, scale);
+            scaleGrad(layer.attn.grad_v, scale);
+            scaleGrad(layer.attn.grad_o, scale);
+            scaleGrad(layer.ffn_norm.grad, scale);
+            scaleGrad(layer.ffn.grad1, scale);
+            scaleGrad(layer.ffn.grad2, scale);
+            scaleGrad(layer.ffn.grad3, scale);
+        }
+        scaleGrad(m.out_norm.grad, scale);
+        scaleGrad(m.out_proj.grad, scale);
+    }
+}
+
+fn saveModel(path: []const u8, m: *const Model) !void {
     const f = try std.fs.cwd().createFile(path, .{});
     defer f.close();
-    try f.writeAll(std.mem.sliceAsBytes(emb.weights));
-    try f.writeAll(std.mem.sliceAsBytes(fc1.weights));
-    try f.writeAll(std.mem.sliceAsBytes(fc1.bias));
-    try f.writeAll(std.mem.sliceAsBytes(ln.gamma));
-    try f.writeAll(std.mem.sliceAsBytes(ln.beta));
-    try f.writeAll(std.mem.sliceAsBytes(fc2.weights));
-    try f.writeAll(std.mem.sliceAsBytes(fc2.bias));
+    try f.writeAll(std.mem.sliceAsBytes(m.emb.weights));
+    for (m.layers) |layer| {
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn_norm.gamma));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.wq));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.wk));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.wv));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.wo));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn_norm.gamma));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn.w1));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn.w2));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn.w3));
+    }
+    try f.writeAll(std.mem.sliceAsBytes(m.out_norm.gamma));
+    try f.writeAll(std.mem.sliceAsBytes(m.out_proj.weights));
 }
 
-fn loadModel(path: []const u8, emb: *Embedding, fc1: *Linear, ln: *LayerNorm, fc2: *Linear) !void {
+fn loadModel(path: []const u8, m: *Model) !void {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
-    _ = try f.readAll(std.mem.sliceAsBytes(emb.weights));
-    _ = try f.readAll(std.mem.sliceAsBytes(fc1.weights));
-    _ = try f.readAll(std.mem.sliceAsBytes(fc1.bias));
-    _ = try f.readAll(std.mem.sliceAsBytes(ln.gamma));
-    _ = try f.readAll(std.mem.sliceAsBytes(ln.beta));
-    _ = try f.readAll(std.mem.sliceAsBytes(fc2.weights));
-    _ = try f.readAll(std.mem.sliceAsBytes(fc2.bias));
+    _ = try f.readAll(std.mem.sliceAsBytes(m.emb.weights));
+    for (&m.layers) |*layer| {
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn_norm.gamma));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.wq));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.wk));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.wv));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.wo));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn_norm.gamma));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.w1));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.w2));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.w3));
+    }
+    _ = try f.readAll(std.mem.sliceAsBytes(m.out_norm.gamma));
+    _ = try f.readAll(std.mem.sliceAsBytes(m.out_proj.weights));
 }
 
-fn generate(emb: *const Embedding, fc1: *const Linear, ln: *LayerNorm, fc2: *const Linear, prompt: []const u8, max_tok: usize, alloc: std.mem.Allocator) !void {
+fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Allocator) !void {
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-    const hidden = try alloc.alloc(f32, D_HIDDEN);
-    defer alloc.free(hidden);
+
+    const x = try alloc.alloc(f32, CONTEXT * D_MODEL);
+    defer alloc.free(x);
+    const attn_out = try alloc.alloc(f32, CONTEXT * D_MODEL);
+    defer alloc.free(attn_out);
+    const ffn_out = try alloc.alloc(f32, CONTEXT * D_MODEL);
+    defer alloc.free(ffn_out);
+    const q = try alloc.alloc(f32, CONTEXT * D_HEAD);
+    defer alloc.free(q);
+    const k = try alloc.alloc(f32, CONTEXT * D_HEAD);
+    defer alloc.free(k);
+    const v = try alloc.alloc(f32, CONTEXT * D_HEAD);
+    defer alloc.free(v);
+    const scores = try alloc.alloc(f32, CONTEXT * CONTEXT);
+    defer alloc.free(scores);
+    const gate = try alloc.alloc(f32, CONTEXT * D_FFN);
+    defer alloc.free(gate);
+    const up = try alloc.alloc(f32, CONTEXT * D_FFN);
+    defer alloc.free(up);
     const logits = try alloc.alloc(f32, VOCAB_SIZE);
     defer alloc.free(logits);
-    const input = try alloc.alloc(f32, D_INPUT);
-    defer alloc.free(input);
 
-    // History buffer
-    var history: [256]u8 = undefined;
+    var history: [512]u8 = undefined;
     var hist_len: usize = 0;
-
-    // Copy prompt to history
     for (prompt) |ch| {
-        if (hist_len < 256) {
+        if (hist_len < 512) {
             history[hist_len] = ch;
             hist_len += 1;
         }
@@ -399,45 +766,55 @@ fn generate(emb: *const Embedding, fc1: *const Linear, ln: *LayerNorm, fc2: *con
     std.debug.print("\n{s}", .{prompt});
 
     for (0..max_tok) |_| {
-        // Build context from history: use [hist_len-CONTEXT, hist_len-1] to predict next
-        for (0..CONTEXT) |ctx| {
-            const idx = if (hist_len > CONTEXT - 1 - ctx) hist_len - CONTEXT + ctx else 0;
-            const tok = if (idx < hist_len) history[idx] else 0;
-            const src = emb.weights[@as(usize, tok) * D_MODEL ..][0..D_MODEL];
-            const dst = input[ctx * D_MODEL ..][0..D_MODEL];
-            @memcpy(dst, src);
+        const seq_start = if (hist_len > CONTEXT) hist_len - CONTEXT else 0;
+        const seq_len = hist_len - seq_start;
+        const context = history[seq_start..hist_len];
+
+        // Embedding
+        m.emb.gather(context, x[0 .. seq_len * D_MODEL]);
+
+        // Process through all transformer layers
+        var x_norm: [CONTEXT * D_MODEL]f32 = undefined;
+        for (&m.layers) |*layer| {
+            // Pre-norm + Attention + Residual
+            @memcpy(x_norm[0 .. seq_len * D_MODEL], x[0 .. seq_len * D_MODEL]);
+            layer.attn_norm.forward(x_norm[0 .. seq_len * D_MODEL], seq_len);
+            layer.attn.forward(x_norm[0 .. seq_len * D_MODEL], attn_out[0 .. seq_len * D_MODEL],
+                           q[0 .. seq_len * D_HEAD], k[0 .. seq_len * D_HEAD], v[0 .. seq_len * D_HEAD],
+                           scores[0 .. seq_len * seq_len], seq_len);
+            for (0..seq_len * D_MODEL) |i| x[i] += attn_out[i]; // Residual
+
+            // Pre-norm + FFN + Residual
+            @memcpy(x_norm[0 .. seq_len * D_MODEL], x[0 .. seq_len * D_MODEL]);
+            layer.ffn_norm.forward(x_norm[0 .. seq_len * D_MODEL], seq_len);
+            layer.ffn.forward(x_norm[0 .. seq_len * D_MODEL], ffn_out[0 .. seq_len * D_MODEL],
+                          gate[0 .. seq_len * D_FFN], up[0 .. seq_len * D_FFN], seq_len);
+            for (0..seq_len * D_MODEL) |i| x[i] += ffn_out[i]; // Residual
         }
 
-        fc1.forward(input, hidden, 1);
-        ln.forward(hidden, 1);
-        gelu(hidden);
-        fc2.forward(hidden, logits, 1);
+        // Output: last position only
+        const last_pos = (seq_len - 1) * D_MODEL;
+        var last_hidden: [D_MODEL]f32 = undefined;
+        @memcpy(&last_hidden, x[last_pos..][0..D_MODEL]);
+        m.out_norm.forward(&last_hidden, 1);
+        m.out_proj.forward(&last_hidden, logits, 1);
 
         // Temperature sampling
         var max_v: f32 = logits[0];
         for (logits) |l| max_v = @max(max_v, l);
         var sum: f32 = 0;
-        const temp: f32 = 0.8;
-        for (logits) |*l| {
-            l.* = @exp((l.* - max_v) / temp);
-            sum += l.*;
-        }
+        const temp: f32 = 0.8; // Temperature for sampling
+        for (logits) |*l| { l.* = @exp((l.* - max_v) / temp); sum += l.*; }
         for (logits) |*l| l.* /= sum;
 
         var r = prng.random().float(f32);
         var next: u8 = 0;
-        for (logits, 0..) |p, i| {
-            r -= p;
-            if (r <= 0) {
-                next = @intCast(i);
-                break;
-            }
-        }
+        for (logits, 0..) |p, i| { r -= p; if (r <= 0) { next = @intCast(i); break; } }
 
         if (next >= 32 and next < 127) std.debug.print("{c}", .{next})
         else if (next == '\n') std.debug.print("\n", .{});
 
-        if (hist_len < 256) { history[hist_len] = next; hist_len += 1; }
+        if (hist_len < 512) { history[hist_len] = next; hist_len += 1; }
     }
     std.debug.print("\n", .{});
 }
@@ -450,23 +827,34 @@ pub fn main() !void {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
 
-    // Model: Embed(8 tokens) -> FC1 -> LayerNorm -> GELU -> FC2 -> Softmax
-    var emb = try Embedding.init(alloc, VOCAB_SIZE, D_MODEL);
-    var fc1 = try Linear.init(alloc, D_INPUT, D_HIDDEN, 123);
-    var ln = try LayerNorm.init(alloc, D_HIDDEN, BATCH_SIZE);
-    var fc2 = try Linear.init(alloc, D_HIDDEN, VOCAB_SIZE, 456);
+    // Initialize model
+    var layers: [N_LAYERS]TransformerLayer = undefined;
+    for (&layers) |*layer| {
+        layer.* = TransformerLayer{
+            .attn_norm = try RMSNorm.init(alloc, D_MODEL, BATCH_SIZE * CONTEXT),
+            .attn = try Attention.init(alloc, D_HEAD),
+            .ffn_norm = try RMSNorm.init(alloc, D_MODEL, BATCH_SIZE * CONTEXT),
+            .ffn = try SwiGLU.init(alloc, D_MODEL, D_FFN, BATCH_SIZE * CONTEXT),
+        };
+    }
+    var model = Model{
+        .emb = try Embedding.init(alloc, VOCAB_SIZE, D_MODEL),
+        .layers = layers,
+        .out_norm = try RMSNorm.init(alloc, D_MODEL, BATCH_SIZE * CONTEXT),
+        .out_proj = try Linear.init(alloc, D_MODEL, VOCAB_SIZE, 999),
+    };
 
     if (args.len > 1 and std.mem.eql(u8, args[1], "--generate")) {
-        loadModel("model.bin", &emb, &fc1, &ln, &fc2) catch {
-            std.debug.print("Error: model.bin not found\n", .{});
+        loadModel("model.bin", &model) catch {
+            std.debug.print("Error: model.bin not found. Train first.\n", .{});
             return;
         };
-        try generate(&emb, &fc1, &ln, &fc2, if (args.len > 2) args[2] else "A: Hello", 200, alloc);
+        try generate(&model, if (args.len > 2) args[2] else "A: Hello", 200, alloc);
         return;
     }
 
     const file = std.fs.cwd().openFile("dailydialog.txt", .{}) catch {
-        std.debug.print("Error: dailydialog.txt not found\n", .{});
+        std.debug.print("Error: dailydialog.txt not found. Run: python3 fetch_data.py\n", .{});
         return;
     };
     defer file.close();
@@ -474,83 +862,223 @@ pub fn main() !void {
     const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
     defer std.posix.munmap(data);
 
-    std.debug.print("Loaded {d:.1}MB | Context={d} tokens | GELU + LayerNorm\n", .{@as(f32, @floatFromInt(size)) / 1e6, CONTEXT});
+    std.debug.print("Modern Transformer | ctx={d} | d={d} | RoPE + RMSNorm + SwiGLU\n", .{CONTEXT, D_MODEL});
+    std.debug.print("Loaded {d:.1}MB | {d} steps | cosine LR schedule\n", .{@as(f32, @floatFromInt(size)) / 1e6, MAX_STEPS});
 
-    // Buffers
-    const offsets = try alloc.alloc(usize, BATCH_SIZE);
-    defer alloc.free(offsets);
-    const targets = try alloc.alloc(u8, BATCH_SIZE);
+    // Training buffers
+    const tokens = try alloc.alloc(u8, BATCH_SIZE * CONTEXT);
+    defer alloc.free(tokens);
+    const targets = try alloc.alloc(u8, BATCH_SIZE * CONTEXT);
     defer alloc.free(targets);
-    const input_batch = try alloc.alloc(f32, BATCH_SIZE * D_INPUT);
-    defer alloc.free(input_batch);
-    const hidden_batch = try alloc.alloc(f32, BATCH_SIZE * D_HIDDEN);
-    defer alloc.free(hidden_batch);
-    const hidden_pre_gelu = try alloc.alloc(f32, BATCH_SIZE * D_HIDDEN);
-    defer alloc.free(hidden_pre_gelu);
-    const logits_batch = try alloc.alloc(f32, BATCH_SIZE * VOCAB_SIZE);
-    defer alloc.free(logits_batch);
-    const hidden_grad = try alloc.alloc(f32, BATCH_SIZE * D_HIDDEN);
-    defer alloc.free(hidden_grad);
-    const logits_grad = try alloc.alloc(f32, BATCH_SIZE * VOCAB_SIZE);
+    const x = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+    defer alloc.free(x);
+
+    // Per-layer intermediate buffers (needed for backward pass)
+    // x_orig_*: original input before normalization (for norm backward)
+    // x_normed_*: normalized input after norm (for attn/ffn backward)
+    var x_orig_attn: [N_LAYERS][]f32 = undefined;
+    var x_normed_attn: [N_LAYERS][]f32 = undefined;
+    var x_orig_ffn: [N_LAYERS][]f32 = undefined;
+    var x_normed_ffn: [N_LAYERS][]f32 = undefined;
+    var attn_out: [N_LAYERS][]f32 = undefined;
+    var ffn_out: [N_LAYERS][]f32 = undefined;
+    var q_buf: [N_LAYERS][]f32 = undefined;
+    var k_buf: [N_LAYERS][]f32 = undefined;
+    var v_buf: [N_LAYERS][]f32 = undefined;
+    var scores_buf: [N_LAYERS][]f32 = undefined;
+    var gate_buf: [N_LAYERS][]f32 = undefined;
+    var up_buf: [N_LAYERS][]f32 = undefined;
+    var gate_pre: [N_LAYERS][]f32 = undefined;
+
+    for (0..N_LAYERS) |l| {
+        x_orig_attn[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+        x_normed_attn[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+        x_orig_ffn[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+        x_normed_ffn[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+        attn_out[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+        ffn_out[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+        q_buf[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_HEAD);
+        k_buf[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_HEAD);
+        v_buf[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_HEAD);
+        scores_buf[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * CONTEXT);
+        gate_buf[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_FFN);
+        up_buf[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_FFN);
+        gate_pre[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_FFN);
+    }
+    defer {
+        for (0..N_LAYERS) |l| {
+            alloc.free(x_orig_attn[l]);
+            alloc.free(x_normed_attn[l]);
+            alloc.free(x_orig_ffn[l]);
+            alloc.free(x_normed_ffn[l]);
+            alloc.free(attn_out[l]);
+            alloc.free(ffn_out[l]);
+            alloc.free(q_buf[l]);
+            alloc.free(k_buf[l]);
+            alloc.free(v_buf[l]);
+            alloc.free(scores_buf[l]);
+            alloc.free(gate_buf[l]);
+            alloc.free(up_buf[l]);
+            alloc.free(gate_pre[l]);
+        }
+    }
+
+    const logits = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * VOCAB_SIZE);
+    defer alloc.free(logits);
+    const logits_grad = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * VOCAB_SIZE);
     defer alloc.free(logits_grad);
-    const input_grad = try alloc.alloc(f32, BATCH_SIZE * D_INPUT);
-    defer alloc.free(input_grad);
+    const x_grad = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+    defer alloc.free(x_grad);
+    // Extra buffers for backward pass
+    const x_out = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+    defer alloc.free(x_out);
+    const layer_grad = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+    defer alloc.free(layer_grad);
+    const layer_in_grad = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+    defer alloc.free(layer_in_grad);
 
-    const start = std.time.milliTimestamp();
-    var tokens: usize = 0;
-    var loss_sum: f32 = 0;
-    var loss_count: usize = 0;
-
-    // Random position sampling for better generalization
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
     const rand = prng.random();
 
+    const start = std.time.milliTimestamp();
+    var total_tokens: usize = 0;
+    var loss_sum: f32 = 0;
+    var loss_count: usize = 0;
+
     var step: usize = 0;
-    while (step < 5000) : (step += 1) {
-        // Sample random batch positions (need at least CONTEXT chars before)
-        for (0..BATCH_SIZE) |i| {
-            const pos = CONTEXT + rand.uintLessThan(usize, size - CONTEXT - 1);
-            offsets[i] = pos;
-            targets[i] = data[pos];
+    while (step < MAX_STEPS) : (step += 1) {
+        const seq_len = CONTEXT;
+
+        // Sample random sequences
+        for (0..BATCH_SIZE) |b| {
+            const pos = rand.uintLessThan(usize, size - CONTEXT - 1);
+            for (0..seq_len) |t| {
+                tokens[b * seq_len + t] = data[pos + t];
+                targets[b * seq_len + t] = data[pos + t + 1];
+            }
         }
 
-        // Forward: gather context embeddings
-        emb.gatherContext(data, offsets, input_batch, BATCH_SIZE);
-        fc1.forward(input_batch, hidden_batch, BATCH_SIZE);
-        @memcpy(hidden_pre_gelu, hidden_batch); // Save for backward
-        ln.forward(hidden_batch, BATCH_SIZE);
-        gelu(hidden_batch);
-        fc2.forward(hidden_batch, logits_batch, BATCH_SIZE);
+        const n = BATCH_SIZE * seq_len;
 
-        const loss = softmaxCE(logits_batch, targets, BATCH_SIZE);
+        // Forward pass
+        model.emb.gather(tokens[0..n], x[0 .. n * D_MODEL]);
+
+        // Process through all layers
+        for (0..N_LAYERS) |l| {
+            // Save original x before attn_norm (for backward)
+            @memcpy(x_orig_attn[l][0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+            // Normalize and save for attention
+            @memcpy(x_normed_attn[l][0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+            model.layers[l].attn_norm.forward(x_normed_attn[l][0 .. n * D_MODEL], n);
+
+            // Process each sequence separately for causal attention
+            for (0..BATCH_SIZE) |b| {
+                const offset = b * seq_len;
+                model.layers[l].attn.forward(
+                    x_normed_attn[l][offset * D_MODEL ..][0 .. seq_len * D_MODEL],
+                    attn_out[l][offset * D_MODEL ..][0 .. seq_len * D_MODEL],
+                    q_buf[l][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                    k_buf[l][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                    v_buf[l][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                    scores_buf[l][b * seq_len * seq_len ..][0 .. seq_len * seq_len],
+                    seq_len
+                );
+            }
+            for (0..n * D_MODEL) |i| x[i] += attn_out[l][i];
+
+            // Save original x before ffn_norm (for backward)
+            @memcpy(x_orig_ffn[l][0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+            // Normalize and save for FFN
+            @memcpy(x_normed_ffn[l][0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+            model.layers[l].ffn_norm.forward(x_normed_ffn[l][0 .. n * D_MODEL], n);
+            model.layers[l].ffn.forward(x_normed_ffn[l][0 .. n * D_MODEL], ffn_out[l][0 .. n * D_MODEL],
+                              gate_buf[l][0 .. n * D_FFN], up_buf[l][0 .. n * D_FFN], n);
+            // Recompute gate_pre before SiLU for backward
+            c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+                @intCast(n), @intCast(D_FFN), @intCast(D_MODEL),
+                1.0, x_normed_ffn[l].ptr, @intCast(D_MODEL), model.layers[l].ffn.w1.ptr, @intCast(D_MODEL),
+                0.0, gate_pre[l].ptr, @intCast(D_FFN));
+            for (0..n * D_MODEL) |i| x[i] += ffn_out[l][i];
+        }
+
+        // Output norm + projection
+        @memcpy(x_out[0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+        model.out_norm.forward(x_out[0 .. n * D_MODEL], n);
+        model.out_proj.forward(x_out[0 .. n * D_MODEL], logits[0 .. n * VOCAB_SIZE], n);
+
+        const loss = softmaxCE(logits[0 .. n * VOCAB_SIZE], targets[0..n], n);
         loss_sum += loss;
         loss_count += 1;
-        tokens += BATCH_SIZE;
+        total_tokens += n;
 
-        // Backward
-        softmaxBackward(logits_batch, targets, logits_grad, BATCH_SIZE);
-        fc2.backward(hidden_batch, logits_grad, hidden_grad, BATCH_SIZE);
-        geluBackward(hidden_batch, hidden_pre_gelu, hidden_grad);
-        ln.backward(hidden_pre_gelu, hidden_grad, BATCH_SIZE);
-        fc1.backward(input_batch, hidden_grad, input_grad, BATCH_SIZE);
-        emb.accumulateGrad(data, offsets, input_grad, BATCH_SIZE);
+        // Backward pass
+        softmaxBackward(logits[0 .. n * VOCAB_SIZE], targets[0..n], logits_grad[0 .. n * VOCAB_SIZE], n);
 
-        // Update
-        fc1.applyGradients(step);
-        ln.applyGradients(step);
-        fc2.applyGradients(step);
-        emb.applyGradients(step);
+        // Output projection backward
+        model.out_proj.backward(x_out[0 .. n * D_MODEL], logits_grad[0 .. n * VOCAB_SIZE], x_grad[0 .. n * D_MODEL], n);
+        model.out_norm.backward(x[0 .. n * D_MODEL], x_grad[0 .. n * D_MODEL], n);
 
-        if (step % 50 == 0) {
+        // Process layers in reverse order
+        var l: usize = N_LAYERS;
+        while (l > 0) {
+            l -= 1;
+
+            // FFN backward (gradient flows through residual)
+            @memcpy(layer_grad[0 .. n * D_MODEL], x_grad[0 .. n * D_MODEL]);
+            // ffn.backward uses the normalized input (x_normed_ffn)
+            model.layers[l].ffn.backward(x_normed_ffn[l][0 .. n * D_MODEL], layer_grad[0 .. n * D_MODEL], layer_in_grad[0 .. n * D_MODEL],
+                               gate_pre[l][0 .. n * D_FFN], up_buf[l][0 .. n * D_FFN], gate_buf[l][0 .. n * D_FFN], n);
+            // ffn_norm.backward uses the original input before normalization (x_orig_ffn)
+            model.layers[l].ffn_norm.backward(x_orig_ffn[l][0 .. n * D_MODEL], layer_in_grad[0 .. n * D_MODEL], n);
+            for (0..n * D_MODEL) |i| x_grad[i] += layer_in_grad[i];
+
+            // Attention backward
+            @memcpy(layer_grad[0 .. n * D_MODEL], x_grad[0 .. n * D_MODEL]);
+            for (0..BATCH_SIZE) |b| {
+                const offset = b * seq_len;
+                // attn.backward uses the normalized input (x_normed_attn)
+                model.layers[l].attn.backward(
+                    x_normed_attn[l][offset * D_MODEL ..][0 .. seq_len * D_MODEL],
+                    layer_grad[offset * D_MODEL ..][0 .. seq_len * D_MODEL],
+                    layer_in_grad[offset * D_MODEL ..][0 .. seq_len * D_MODEL],
+                    q_buf[l][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                    k_buf[l][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                    v_buf[l][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                    scores_buf[l][b * seq_len * seq_len ..][0 .. seq_len * seq_len],
+                    seq_len
+                );
+            }
+            // attn_norm.backward uses the original input before normalization (x_orig_attn)
+            model.layers[l].attn_norm.backward(x_orig_attn[l][0 .. n * D_MODEL], layer_in_grad[0 .. n * D_MODEL], n);
+            for (0..n * D_MODEL) |i| x_grad[i] += layer_in_grad[i];
+        }
+
+        // Embedding backward
+        model.emb.accumulateGrad(tokens[0..n], x_grad[0 .. n * D_MODEL]);
+
+        // Clip gradients and update all parameters
+        clipGradients(&model);
+        model.emb.applyGradients(step);
+        for (&model.layers) |*layer| {
+            layer.attn_norm.applyGradients(step);
+            layer.attn.applyGradients(step);
+            layer.ffn_norm.applyGradients(step);
+            layer.ffn.applyGradients(step);
+        }
+        model.out_norm.applyGradients(step);
+        model.out_proj.applyGradients(step);
+
+        if (step % 100 == 0) {
             const elapsed = @as(f32, @floatFromInt(std.time.milliTimestamp() - start)) / 1000.0;
-            const avg = loss_sum / @as(f32, @floatFromInt(loss_count));
-            const tps = @as(f32, @floatFromInt(tokens)) / elapsed;
-            std.debug.print("\x1b[2J\x1b[HStep: {d} | Loss: {d:.3} | TPS: {d:.0}K | LR: {d:.4}\n", .{step, avg, tps/1000, getLR(step)});
+            const avg_loss = loss_sum / @as(f32, @floatFromInt(loss_count));
+            const tps = @as(f32, @floatFromInt(total_tokens)) / elapsed;
+            std.debug.print("\x1b[2J\x1b[HStep: {d}/{d} | Loss: {d:.3} | TPS: {d:.0}K | LR: {d:.6}\n",
+                          .{step, MAX_STEPS, avg_loss, tps/1000, getLR(step)});
             loss_sum = 0;
             loss_count = 0;
         }
     }
 
-    try saveModel("model.bin", &emb, &fc1, &ln, &fc2);
-    std.debug.print("\nTraining complete.\n", .{});
+    try saveModel("model.bin", &model);
+    std.debug.print("\nTraining complete. Model saved to model.bin\n", .{});
 }
