@@ -5,12 +5,13 @@ const c = @cImport({
 
 // --- Modern Transformer Architecture ---
 // Based on LLaMA: RMSNorm, RoPE, SwiGLU, Single-head Attention
+// Reduced size to prevent overfitting on small dataset (~1.3M tokens)
 const VOCAB_SIZE: usize = 256;
 const CONTEXT: usize = 64;
-const D_MODEL: usize = 256; // Larger embedding
-const D_HEAD: usize = 256; // Match D_MODEL
-const D_FFN: usize = 1024; // 4x D_MODEL
-const BATCH_SIZE: usize = 16; // Smaller batch for larger model
+const D_MODEL: usize = 128; // Reduced from 256 (better for small data)
+const D_HEAD: usize = 128; // Match D_MODEL
+const D_FFN: usize = 512; // 4x D_MODEL
+const BATCH_SIZE: usize = 32; // Larger batch with smaller model
 
 const BASE_LR: f32 = 0.001; // Muon LR (tuned for this model)
 const WARMUP_STEPS: usize = 500;
@@ -19,6 +20,16 @@ const GRAD_CLIP: f32 = 1.0; // Gradient clipping
 const MUON_MOMENTUM: f32 = 0.95; // Muon momentum
 const EPSILON: f32 = 1e-8;
 const WEIGHT_DECAY: f32 = 0.01; // Lower weight decay for Muon
+const EMA_DECAY: f32 = 0.999; // EMA decay for weight averaging
+const REFERENCE_DIM: f32 = 64.0; // Reference dimension for µP scaling
+const NS_ITERATIONS: usize = 5; // Newton-Schulz iterations for Muon
+
+// Regularization hyperparameters
+const DROPOUT_ATTN: f32 = 0.1; // Dropout after attention
+const DROPOUT_FFN: f32 = 0.1; // Dropout after FFN
+const LABEL_SMOOTHING: f32 = 0.1; // Label smoothing factor
+const VAL_RATIO: f32 = 0.1; // Validation set ratio
+const PATIENCE: usize = 5; // Early stopping patience (in 500-step intervals)
 
 // Cosine LR schedule with warmup
 fn getLR(step: usize) f32 {
@@ -29,11 +40,129 @@ fn getLR(step: usize) f32 {
     return BASE_LR * 0.5 * (1.0 + @cos(std.math.pi * progress));
 }
 
+// µP-style LR scaling: different learning rates for different layer types
+fn getEmbeddingLR(step: usize) f32 {
+    return getLR(step) * (REFERENCE_DIM / @as(f32, @floatFromInt(D_MODEL)));
+}
+
+fn getAttentionLR(step: usize) f32 {
+    return getLR(step) * @sqrt(REFERENCE_DIM / @as(f32, @floatFromInt(D_MODEL)));
+}
+
+fn getOutputLR(step: usize) f32 {
+    return getLR(step) * (REFERENCE_DIM / @as(f32, @floatFromInt(D_MODEL)));
+}
+
+// Newton-Schulz orthogonalization for true Muon
+// Approximates G · (GᵀG)^{-1/2} via iteration: G ← G · (I - 0.5·GᵀG)
+fn newtonSchulzOrthogonalize(grad: []f32, dim: usize) void {
+    var temp: [D_MODEL * D_MODEL]f32 = undefined;
+    var new_grad: [D_MODEL * D_MODEL]f32 = undefined;
+    const size = dim * dim;
+
+    // First normalize the gradient to have unit Frobenius norm for stability
+    var frob_sq: f32 = 0;
+    for (grad[0..size]) |g| frob_sq += g * g;
+    const frob = @sqrt(frob_sq + EPSILON);
+    for (grad[0..size]) |*g| g.* /= frob;
+
+    for (0..NS_ITERATIONS) |_| {
+        // temp = Gᵀ @ G (dim x dim)
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasTrans, c.CblasNoTrans,
+            @intCast(dim), @intCast(dim), @intCast(dim),
+            1.0, grad.ptr, @intCast(dim), grad.ptr, @intCast(dim),
+            0.0, &temp, @intCast(dim));
+
+        // temp = I - 0.5 * temp (in-place)
+        for (0..dim) |i| {
+            for (0..dim) |j| {
+                const idx = i * dim + j;
+                temp[idx] = (if (i == j) @as(f32, 1.0) else @as(f32, 0.0)) - 0.5 * temp[idx];
+            }
+        }
+
+        // new_grad = G @ temp
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(dim), @intCast(dim), @intCast(dim),
+            1.0, grad.ptr, @intCast(dim), &temp, @intCast(dim),
+            0.0, &new_grad, @intCast(dim));
+
+        @memcpy(grad[0..size], new_grad[0..size]);
+    }
+
+    // Restore scale (optional: can adjust this for different effective learning rates)
+    for (grad[0..size]) |*g| g.* *= frob;
+}
+
+// Dropout: randomly zero elements during training, scale by 1/(1-p)
+fn applyDropout(x: []f32, mask: []f32, p: f32, rand: std.Random) void {
+    const scale = 1.0 / (1.0 - p);
+    for (x, mask) |*val, *m| {
+        if (rand.float(f32) < p) {
+            m.* = 0.0;
+            val.* = 0.0;
+        } else {
+            m.* = scale;
+            val.* *= scale;
+        }
+    }
+}
+
+fn applyDropoutBackward(grad: []f32, mask: []const f32) void {
+    for (grad, mask) |*g, m| g.* *= m;
+}
+
+// Label smoothing: (1-ε)·target + ε·uniform
+fn softmaxCESmoothed(logits: []f32, targets: []const u8, n: usize, smoothing: f32) f32 {
+    var loss: f32 = 0;
+    const n_classes = @as(f32, VOCAB_SIZE);
+
+    for (0..n) |i| {
+        const row = logits[i * VOCAB_SIZE ..][0..VOCAB_SIZE];
+        var max_v: f32 = row[0];
+        for (row) |l| max_v = @max(max_v, l);
+        var sum: f32 = 0;
+        for (row) |*l| {
+            l.* = @exp(l.* - max_v);
+            sum += l.*;
+        }
+        for (row) |*l| l.* /= sum;
+
+        // Log probabilities
+        const target_log_prob = @log(@max(row[targets[i]], 1e-10));
+        var uniform_log_prob: f32 = 0;
+        for (row) |p| uniform_log_prob += @log(@max(p, 1e-10));
+        uniform_log_prob /= n_classes;
+
+        // Smoothed loss
+        loss -= (1.0 - smoothing) * target_log_prob + smoothing * uniform_log_prob;
+    }
+    return loss / @as(f32, @floatFromInt(n));
+}
+
+fn softmaxBackwardSmoothed(probs: []f32, targets: []const u8, grad: []f32, n: usize, smoothing: f32) void {
+    const scale = 1.0 / @as(f32, @floatFromInt(n));
+    const uniform = smoothing / @as(f32, VOCAB_SIZE);
+
+    for (0..n) |i| {
+        const prob_row = probs[i * VOCAB_SIZE ..][0..VOCAB_SIZE];
+        const grad_row = grad[i * VOCAB_SIZE ..][0..VOCAB_SIZE];
+
+        for (prob_row, grad_row) |p, *g| {
+            // Gradient: p - y_smoothed, where y_smoothed = (1-ε)·one_hot + ε·uniform
+            g.* = scale * (p - uniform);
+        }
+        // Adjust for the one-hot target position
+        grad_row[targets[i]] -= scale * (1.0 - smoothing);
+    }
+}
+
 // RMSNorm (LLaMA) - simpler and faster than LayerNorm
 const RMSNorm = struct {
     gamma: []f32,
+    ema_gamma: []f32, // EMA weights for generation
     dim: usize,
-    // Adam state
+    // Optimizer state
     m: []f32,
     v: []f32,
     grad: []f32,
@@ -42,16 +171,30 @@ const RMSNorm = struct {
 
     pub fn init(alloc: std.mem.Allocator, dim: usize, max_batch: usize) !RMSNorm {
         const gamma = try alloc.alloc(f32, dim);
+        const ema_gamma = try alloc.alloc(f32, dim);
         for (gamma) |*g| g.* = 1.0;
+        for (ema_gamma) |*g| g.* = 1.0;
 
         return .{
             .gamma = gamma,
+            .ema_gamma = ema_gamma,
             .dim = dim,
             .m = try alloc.alloc(f32, dim),
             .v = try alloc.alloc(f32, dim),
             .grad = try alloc.alloc(f32, dim),
             .rstd = try alloc.alloc(f32, max_batch * CONTEXT),
         };
+    }
+
+    pub fn forwardEMA(self: *RMSNorm, x: []f32, n: usize) void {
+        const eps: f32 = 1e-6;
+        for (0..n) |i| {
+            const row = x[i * self.dim ..][0..self.dim];
+            var ss: f32 = 0;
+            for (row) |v| ss += v * v;
+            const rstd = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(self.dim)) + eps);
+            for (row, 0..) |*v, j| v.* = v.* * rstd * self.ema_gamma[j];
+        }
     }
 
     pub fn forward(self: *RMSNorm, x: []f32, n: usize) void {
@@ -101,19 +244,29 @@ const RMSNorm = struct {
             const g_norm = self.grad[i] / rms;
             self.m[i] = MUON_MOMENTUM * self.m[i] + g_norm;
             self.gamma[i] -= lr * self.m[i];
+            // Update EMA
+            self.ema_gamma[i] = EMA_DECAY * self.ema_gamma[i] + (1.0 - EMA_DECAY) * self.gamma[i];
         }
         @memset(self.grad, 0);
     }
 };
 
-// Single-head Self-Attention with RoPE
+// Single-head Self-Attention with RoPE and QK-Norm
 const Attention = struct {
     wq: []f32,
     wk: []f32,
     wv: []f32,
     wo: []f32,
+    // EMA weights for generation
+    ema_wq: []f32,
+    ema_wk: []f32,
+    ema_wv: []f32,
+    ema_wo: []f32,
     dim: usize,
-    // Adam state for each weight matrix
+    // QK-Norm: RMSNorm applied to Q and K before RoPE (stabilizes attention)
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    // Optimizer state for each weight matrix
     m_q: []f32, v_q: []f32, grad_q: []f32,
     m_k: []f32, v_k: []f32, grad_k: []f32,
     m_v: []f32, v_v: []f32, grad_v: []f32,
@@ -131,10 +284,30 @@ const Attention = struct {
         const wk = try alloc.alloc(f32, size);
         const wv = try alloc.alloc(f32, size);
         const wo = try alloc.alloc(f32, size);
-        for (wq) |*w| w.* = prng.random().floatNorm(f32) * scale;
-        for (wk) |*w| w.* = prng.random().floatNorm(f32) * scale;
-        for (wv) |*w| w.* = prng.random().floatNorm(f32) * scale;
-        for (wo) |*w| w.* = prng.random().floatNorm(f32) * scale;
+        const ema_wq = try alloc.alloc(f32, size);
+        const ema_wk = try alloc.alloc(f32, size);
+        const ema_wv = try alloc.alloc(f32, size);
+        const ema_wo = try alloc.alloc(f32, size);
+        for (wq, ema_wq) |*w, *ew| {
+            const val = prng.random().floatNorm(f32) * scale;
+            w.* = val;
+            ew.* = val;
+        }
+        for (wk, ema_wk) |*w, *ew| {
+            const val = prng.random().floatNorm(f32) * scale;
+            w.* = val;
+            ew.* = val;
+        }
+        for (wv, ema_wv) |*w, *ew| {
+            const val = prng.random().floatNorm(f32) * scale;
+            w.* = val;
+            ew.* = val;
+        }
+        for (wo, ema_wo) |*w, *ew| {
+            const val = prng.random().floatNorm(f32) * scale;
+            w.* = val;
+            ew.* = val;
+        }
 
         // Precompute RoPE frequencies
         const cos_cache = try alloc.alloc(f32, CONTEXT * dim / 2);
@@ -149,7 +322,11 @@ const Attention = struct {
         }
 
         return .{
-            .wq = wq, .wk = wk, .wv = wv, .wo = wo, .dim = dim,
+            .wq = wq, .wk = wk, .wv = wv, .wo = wo,
+            .ema_wq = ema_wq, .ema_wk = ema_wk, .ema_wv = ema_wv, .ema_wo = ema_wo,
+            .dim = dim,
+            .q_norm = try RMSNorm.init(alloc, dim, BATCH_SIZE * CONTEXT),
+            .k_norm = try RMSNorm.init(alloc, dim, BATCH_SIZE * CONTEXT),
             .m_q = try alloc.alloc(f32, size), .v_q = try alloc.alloc(f32, size), .grad_q = try alloc.alloc(f32, size),
             .m_k = try alloc.alloc(f32, size), .v_k = try alloc.alloc(f32, size), .grad_k = try alloc.alloc(f32, size),
             .m_v = try alloc.alloc(f32, size), .v_v = try alloc.alloc(f32, size), .grad_v = try alloc.alloc(f32, size),
@@ -187,7 +364,7 @@ const Attention = struct {
         }
     }
 
-    pub fn forward(self: *const Attention, x: []const f32, output: []f32, q: []f32, k: []f32, v: []f32, scores: []f32, seq_len: usize) void {
+    pub fn forward(self: *Attention, x: []const f32, output: []f32, q: []f32, k: []f32, v: []f32, scores: []f32, seq_len: usize) void {
         const d = self.dim;
 
         // Q, K, V projections
@@ -200,6 +377,10 @@ const Attention = struct {
         c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
             @intCast(seq_len), @intCast(d), @intCast(d),
             1.0, x.ptr, @intCast(d), self.wv.ptr, @intCast(d), 0.0, v.ptr, @intCast(d));
+
+        // QK-Norm: apply RMSNorm to Q and K before RoPE (stabilizes attention)
+        self.q_norm.forward(q, seq_len);
+        self.k_norm.forward(k, seq_len);
 
         // Apply RoPE to Q and K
         self.applyRoPE(q, seq_len);
@@ -237,6 +418,59 @@ const Attention = struct {
         c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
             @intCast(seq_len), @intCast(d), @intCast(d),
             1.0, &temp_copy, @intCast(d), self.wo.ptr, @intCast(d), 0.0, output.ptr, @intCast(d));
+    }
+
+    // Forward pass using EMA weights (for generation)
+    pub fn forwardEMA(self: *Attention, x: []const f32, output: []f32, q: []f32, k: []f32, v: []f32, scores: []f32, seq_len: usize) void {
+        const d = self.dim;
+
+        // Q, K, V projections using EMA weights
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, x.ptr, @intCast(d), self.ema_wq.ptr, @intCast(d), 0.0, q.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, x.ptr, @intCast(d), self.ema_wk.ptr, @intCast(d), 0.0, k.ptr, @intCast(d));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, x.ptr, @intCast(d), self.ema_wv.ptr, @intCast(d), 0.0, v.ptr, @intCast(d));
+
+        // QK-Norm using EMA
+        self.q_norm.forwardEMA(q, seq_len);
+        self.k_norm.forwardEMA(k, seq_len);
+
+        // Apply RoPE
+        self.applyRoPE(q, seq_len);
+        self.applyRoPE(k, seq_len);
+
+        // Attention scores
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(d)));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(seq_len), @intCast(d),
+            scale, q.ptr, @intCast(d), k.ptr, @intCast(d), 0.0, scores.ptr, @intCast(seq_len));
+
+        // Causal mask + softmax
+        for (0..seq_len) |i| {
+            const row = scores[i * seq_len ..][0..seq_len];
+            for (i + 1..seq_len) |j| row[j] = -1e9;
+            var max_v: f32 = row[0];
+            for (row[0..i + 1]) |s| max_v = @max(max_v, s);
+            var sum: f32 = 0;
+            for (row[0..i + 1]) |*s| { s.* = @exp(s.* - max_v); sum += s.*; }
+            for (row[0..i + 1]) |*s| s.* /= sum;
+            for (i + 1..seq_len) |j| row[j] = 0;
+        }
+
+        // Output using EMA weights
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasNoTrans,
+            @intCast(seq_len), @intCast(d), @intCast(seq_len),
+            1.0, scores.ptr, @intCast(seq_len), v.ptr, @intCast(d), 0.0, output.ptr, @intCast(d));
+
+        var temp_copy: [CONTEXT * D_HEAD]f32 = undefined;
+        @memcpy(temp_copy[0..seq_len * d], output[0 .. seq_len * d]);
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(seq_len), @intCast(d), @intCast(d),
+            1.0, &temp_copy, @intCast(d), self.ema_wo.ptr, @intCast(d), 0.0, output.ptr, @intCast(d));
     }
 
     pub fn backward(self: *Attention, x: []const f32, out_grad: []const f32, in_grad: []f32,
@@ -318,37 +552,37 @@ const Attention = struct {
     }
 
     pub fn applyGradients(self: *Attention, step: usize) void {
-        const lr = getLR(step);
+        // µP-style LR scaling for attention weights
+        const lr = getAttentionLR(step);
 
-        // Muon: normalize gradients per-row (per output neuron)
+        // True Muon with Newton-Schulz orthogonalization for square weight matrices
         inline for (.{
-            .{ self.wq, self.m_q, self.grad_q },
-            .{ self.wk, self.m_k, self.grad_k },
-            .{ self.wv, self.m_v, self.grad_v },
-            .{ self.wo, self.m_o, self.grad_o },
+            .{ self.wq, self.ema_wq, self.m_q, self.grad_q },
+            .{ self.wk, self.ema_wk, self.m_k, self.grad_k },
+            .{ self.wv, self.ema_wv, self.m_v, self.grad_v },
+            .{ self.wo, self.ema_wo, self.m_o, self.grad_o },
         }) |params| {
             const w = params[0];
-            const m = params[1];
-            const grad = params[2];
+            const ema_w = params[1];
+            const m = params[2];
+            const grad = params[3];
 
-            // Compute per-row RMS and apply Muon update
-            for (0..self.dim) |row| {
-                var rms: f32 = 0;
-                for (0..self.dim) |col| {
-                    const g = grad[row * self.dim + col];
-                    rms += g * g;
-                }
-                rms = @sqrt(rms / @as(f32, @floatFromInt(self.dim)) + EPSILON);
+            // Apply Newton-Schulz orthogonalization (true Muon for square matrices)
+            newtonSchulzOrthogonalize(grad, self.dim);
 
-                for (0..self.dim) |col| {
-                    const idx = row * self.dim + col;
-                    const g_norm = grad[idx] / rms;
-                    m[idx] = MUON_MOMENTUM * m[idx] + g_norm;
-                    w[idx] -= lr * (m[idx] + WEIGHT_DECAY * w[idx]);
-                }
+            // Apply momentum and weight update
+            for (0..self.dim * self.dim) |idx| {
+                m[idx] = MUON_MOMENTUM * m[idx] + grad[idx];
+                w[idx] -= lr * (m[idx] + WEIGHT_DECAY * w[idx]);
+                // Update EMA weights
+                ema_w[idx] = EMA_DECAY * ema_w[idx] + (1.0 - EMA_DECAY) * w[idx];
             }
             @memset(grad, 0);
         }
+
+        // Also update QK-Norm parameters
+        self.q_norm.applyGradients(step);
+        self.k_norm.applyGradients(step);
     }
 };
 
@@ -357,9 +591,13 @@ const SwiGLU = struct {
     w1: []f32, // gate projection
     w2: []f32, // up projection
     w3: []f32, // down projection
+    // EMA weights for generation
+    ema_w1: []f32,
+    ema_w2: []f32,
+    ema_w3: []f32,
     in_dim: usize,
     hidden_dim: usize,
-    // Adam state
+    // Optimizer state
     m1: []f32, v1: []f32, grad1: []f32,
     m2: []f32, v2: []f32, grad2: []f32,
     m3: []f32, v3: []f32, grad3: []f32,
@@ -375,12 +613,28 @@ const SwiGLU = struct {
         const w1 = try alloc.alloc(f32, hidden_d * in_d);
         const w2 = try alloc.alloc(f32, hidden_d * in_d);
         const w3 = try alloc.alloc(f32, in_d * hidden_d);
-        for (w1) |*w| w.* = prng.random().floatNorm(f32) * scale;
-        for (w2) |*w| w.* = prng.random().floatNorm(f32) * scale;
-        for (w3) |*w| w.* = prng.random().floatNorm(f32) * scale;
+        const ema_w1 = try alloc.alloc(f32, hidden_d * in_d);
+        const ema_w2 = try alloc.alloc(f32, hidden_d * in_d);
+        const ema_w3 = try alloc.alloc(f32, in_d * hidden_d);
+        for (w1, ema_w1) |*w, *ew| {
+            const val = prng.random().floatNorm(f32) * scale;
+            w.* = val;
+            ew.* = val;
+        }
+        for (w2, ema_w2) |*w, *ew| {
+            const val = prng.random().floatNorm(f32) * scale;
+            w.* = val;
+            ew.* = val;
+        }
+        for (w3, ema_w3) |*w, *ew| {
+            const val = prng.random().floatNorm(f32) * scale;
+            w.* = val;
+            ew.* = val;
+        }
 
         return .{
             .w1 = w1, .w2 = w2, .w3 = w3,
+            .ema_w1 = ema_w1, .ema_w2 = ema_w2, .ema_w3 = ema_w3,
             .in_dim = in_d, .hidden_dim = hidden_d,
             .m1 = try alloc.alloc(f32, hidden_d * in_d),
             .v1 = try alloc.alloc(f32, hidden_d * in_d),
@@ -419,6 +673,29 @@ const SwiGLU = struct {
         c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
             @intCast(n), @intCast(self.in_dim), @intCast(self.hidden_dim),
             1.0, gate.ptr, @intCast(self.hidden_dim), self.w3.ptr, @intCast(self.hidden_dim),
+            0.0, output.ptr, @intCast(self.in_dim));
+    }
+
+    // Forward pass using EMA weights (for generation)
+    pub fn forwardEMA(self: *const SwiGLU, x: []const f32, output: []f32, gate: []f32, up: []f32, n: usize) void {
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.hidden_dim), @intCast(self.in_dim),
+            1.0, x.ptr, @intCast(self.in_dim), self.ema_w1.ptr, @intCast(self.in_dim),
+            0.0, gate.ptr, @intCast(self.hidden_dim));
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.hidden_dim), @intCast(self.in_dim),
+            1.0, x.ptr, @intCast(self.in_dim), self.ema_w2.ptr, @intCast(self.in_dim),
+            0.0, up.ptr, @intCast(self.hidden_dim));
+
+        for (0..n * self.hidden_dim) |i| {
+            const g = gate[i];
+            const silu = g / (1.0 + @exp(-g));
+            gate[i] = silu * up[i];
+        }
+
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.in_dim), @intCast(self.hidden_dim),
+            1.0, gate.ptr, @intCast(self.hidden_dim), self.ema_w3.ptr, @intCast(self.hidden_dim),
             0.0, output.ptr, @intCast(self.in_dim));
     }
 
@@ -473,16 +750,18 @@ const SwiGLU = struct {
     }
 
     pub fn applyGradients(self: *SwiGLU, step: usize) void {
-        const lr = getLR(step);
+        // µP-style LR scaling for FFN weights (same as attention)
+        const lr = getAttentionLR(step);
 
-        // Muon for w1, w2 (hidden_dim x in_dim)
+        // Muon for w1, w2 (hidden_dim x in_dim) - per-row normalization
         inline for (.{
-            .{ self.w1, self.m1, self.grad1 },
-            .{ self.w2, self.m2, self.grad2 },
+            .{ self.w1, self.ema_w1, self.m1, self.grad1 },
+            .{ self.w2, self.ema_w2, self.m2, self.grad2 },
         }) |params| {
             const w = params[0];
-            const m = params[1];
-            const grad = params[2];
+            const ema_w = params[1];
+            const m = params[2];
+            const grad = params[3];
 
             for (0..self.hidden_dim) |row| {
                 var rms: f32 = 0;
@@ -497,12 +776,14 @@ const SwiGLU = struct {
                     const g_norm = grad[idx] / rms;
                     m[idx] = MUON_MOMENTUM * m[idx] + g_norm;
                     w[idx] -= lr * (m[idx] + WEIGHT_DECAY * w[idx]);
+                    // Update EMA weights
+                    ema_w[idx] = EMA_DECAY * ema_w[idx] + (1.0 - EMA_DECAY) * w[idx];
                 }
             }
             @memset(grad, 0);
         }
 
-        // Muon for w3 (in_dim x hidden_dim)
+        // Muon for w3 (in_dim x hidden_dim) - per-row normalization + EMA
         for (0..self.in_dim) |row| {
             var rms: f32 = 0;
             for (0..self.hidden_dim) |col| {
@@ -516,6 +797,8 @@ const SwiGLU = struct {
                 const g_norm = self.grad3[idx] / rms;
                 self.m3[idx] = MUON_MOMENTUM * self.m3[idx] + g_norm;
                 self.w3[idx] -= lr * (self.m3[idx] + WEIGHT_DECAY * self.w3[idx]);
+                // Update EMA weights
+                self.ema_w3[idx] = EMA_DECAY * self.ema_w3[idx] + (1.0 - EMA_DECAY) * self.w3[idx];
             }
         }
         @memset(self.grad3, 0);
@@ -524,6 +807,7 @@ const SwiGLU = struct {
 
 pub const Embedding = struct {
     weights: []f32,
+    ema_weights: []f32, // EMA weights for generation
     m: []f32,
     v: []f32,
     grad: []f32,
@@ -532,8 +816,13 @@ pub const Embedding = struct {
 
     pub fn init(alloc: std.mem.Allocator, vocab: usize, dim: usize) !Embedding {
         const w = try alloc.alloc(f32, vocab * dim);
+        const ema_w = try alloc.alloc(f32, vocab * dim);
         var prng = std.Random.DefaultPrng.init(42);
-        for (w) |*val| val.* = prng.random().floatNorm(f32) * 0.02;
+        for (w, ema_w) |*val, *ema_val| {
+            const v = prng.random().floatNorm(f32) * 0.02;
+            val.* = v;
+            ema_val.* = v;
+        }
 
         const m = try alloc.alloc(f32, vocab * dim);
         const vv = try alloc.alloc(f32, vocab * dim);
@@ -542,12 +831,21 @@ pub const Embedding = struct {
         @memset(vv, 0);
         @memset(g, 0);
 
-        return .{ .weights = w, .m = m, .v = vv, .grad = g, .vocab = vocab, .dim = dim };
+        return .{ .weights = w, .ema_weights = ema_w, .m = m, .v = vv, .grad = g, .vocab = vocab, .dim = dim };
     }
 
     pub fn gather(self: *const Embedding, tokens: []const u8, output: []f32) void {
         for (tokens, 0..) |tok, i| {
             const src = self.weights[@as(usize, tok) * self.dim ..][0..self.dim];
+            const dst = output[i * self.dim ..][0..self.dim];
+            @memcpy(dst, src);
+        }
+    }
+
+    // Gather using EMA weights (for generation)
+    pub fn gatherEMA(self: *const Embedding, tokens: []const u8, output: []f32) void {
+        for (tokens, 0..) |tok, i| {
+            const src = self.ema_weights[@as(usize, tok) * self.dim ..][0..self.dim];
             const dst = output[i * self.dim ..][0..self.dim];
             @memcpy(dst, src);
         }
@@ -562,9 +860,10 @@ pub const Embedding = struct {
     }
 
     pub fn applyGradients(self: *Embedding, step: usize) void {
-        const lr = getLR(step);
+        // µP-style LR scaling for embeddings (scale by 1/dim)
+        const lr = getEmbeddingLR(step);
 
-        // Muon: normalize per vocabulary token (per row)
+        // Muon: normalize per vocabulary token (per row) + EMA update
         for (0..self.vocab) |row| {
             var rms: f32 = 0;
             for (0..self.dim) |col| {
@@ -578,6 +877,8 @@ pub const Embedding = struct {
                 const g_norm = self.grad[idx] / rms;
                 self.m[idx] = MUON_MOMENTUM * self.m[idx] + g_norm;
                 self.weights[idx] -= lr * self.m[idx];
+                // Update EMA weights
+                self.ema_weights[idx] = EMA_DECAY * self.ema_weights[idx] + (1.0 - EMA_DECAY) * self.weights[idx];
             }
         }
         @memset(self.grad, 0);
@@ -587,6 +888,7 @@ pub const Embedding = struct {
 // Output projection (tied with embedding for efficiency)
 pub const Linear = struct {
     weights: []f32,
+    ema_weights: []f32, // EMA weights for generation
     in_dim: usize,
     out_dim: usize,
     m: []f32,
@@ -595,12 +897,17 @@ pub const Linear = struct {
 
     pub fn init(alloc: std.mem.Allocator, in_d: usize, out_d: usize, seed: u64) !Linear {
         const w = try alloc.alloc(f32, out_d * in_d);
+        const ema_w = try alloc.alloc(f32, out_d * in_d);
         var prng = std.Random.DefaultPrng.init(seed);
         const scale = @sqrt(2.0 / @as(f32, @floatFromInt(in_d)));
-        for (w) |*val| val.* = prng.random().floatNorm(f32) * scale;
+        for (w, ema_w) |*val, *ema_val| {
+            const v = prng.random().floatNorm(f32) * scale;
+            val.* = v;
+            ema_val.* = v;
+        }
 
         return .{
-            .weights = w, .in_dim = in_d, .out_dim = out_d,
+            .weights = w, .ema_weights = ema_w, .in_dim = in_d, .out_dim = out_d,
             .m = try alloc.alloc(f32, out_d * in_d),
             .v = try alloc.alloc(f32, out_d * in_d),
             .grad = try alloc.alloc(f32, out_d * in_d),
@@ -611,6 +918,14 @@ pub const Linear = struct {
         c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
             @intCast(n), @intCast(self.out_dim), @intCast(self.in_dim),
             1.0, input.ptr, @intCast(self.in_dim), self.weights.ptr, @intCast(self.in_dim),
+            0.0, output.ptr, @intCast(self.out_dim));
+    }
+
+    // Forward pass using EMA weights (for generation)
+    pub fn forwardEMA(self: *const Linear, input: []const f32, output: []f32, n: usize) void {
+        c.cblas_sgemm(c.CblasRowMajor, c.CblasNoTrans, c.CblasTrans,
+            @intCast(n), @intCast(self.out_dim), @intCast(self.in_dim),
+            1.0, input.ptr, @intCast(self.in_dim), self.ema_weights.ptr, @intCast(self.in_dim),
             0.0, output.ptr, @intCast(self.out_dim));
     }
 
@@ -627,9 +942,10 @@ pub const Linear = struct {
     }
 
     pub fn applyGradients(self: *Linear, step: usize) void {
-        const lr = getLR(step);
+        // µP-style LR scaling for output projection (scale by 1/dim)
+        const lr = getOutputLR(step);
 
-        // Muon: normalize per output neuron (per row)
+        // Muon: normalize per output neuron (per row) + EMA update
         for (0..self.out_dim) |row| {
             var rms: f32 = 0;
             for (0..self.in_dim) |col| {
@@ -643,6 +959,8 @@ pub const Linear = struct {
                 const g_norm = self.grad[idx] / rms;
                 self.m[idx] = MUON_MOMENTUM * self.m[idx] + g_norm;
                 self.weights[idx] -= lr * (self.m[idx] + WEIGHT_DECAY * self.weights[idx]);
+                // Update EMA weights
+                self.ema_weights[idx] = EMA_DECAY * self.ema_weights[idx] + (1.0 - EMA_DECAY) * self.weights[idx];
             }
         }
         @memset(self.grad, 0);
@@ -670,7 +988,7 @@ fn softmaxBackward(probs: []f32, targets: []const u8, grad: []f32, n: usize) voi
     for (0..n) |i| grad[i * VOCAB_SIZE + targets[i]] -= scale;
 }
 
-const N_LAYERS: usize = 4;
+const N_LAYERS: usize = 3; // Reduced from 4 (better for small data)
 
 const TransformerLayer = struct {
     attn_norm: RMSNorm,
@@ -738,6 +1056,7 @@ fn clipGradients(m: *Model) void {
 fn saveModel(path: []const u8, m: *const Model) !void {
     const f = try std.fs.cwd().createFile(path, .{});
     defer f.close();
+    // Save training weights
     try f.writeAll(std.mem.sliceAsBytes(m.emb.weights));
     for (m.layers) |layer| {
         try f.writeAll(std.mem.sliceAsBytes(layer.attn_norm.gamma));
@@ -745,6 +1064,8 @@ fn saveModel(path: []const u8, m: *const Model) !void {
         try f.writeAll(std.mem.sliceAsBytes(layer.attn.wk));
         try f.writeAll(std.mem.sliceAsBytes(layer.attn.wv));
         try f.writeAll(std.mem.sliceAsBytes(layer.attn.wo));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.q_norm.gamma));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.k_norm.gamma));
         try f.writeAll(std.mem.sliceAsBytes(layer.ffn_norm.gamma));
         try f.writeAll(std.mem.sliceAsBytes(layer.ffn.w1));
         try f.writeAll(std.mem.sliceAsBytes(layer.ffn.w2));
@@ -752,11 +1073,29 @@ fn saveModel(path: []const u8, m: *const Model) !void {
     }
     try f.writeAll(std.mem.sliceAsBytes(m.out_norm.gamma));
     try f.writeAll(std.mem.sliceAsBytes(m.out_proj.weights));
+    // Save EMA weights (for generation)
+    try f.writeAll(std.mem.sliceAsBytes(m.emb.ema_weights));
+    for (m.layers) |layer| {
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn_norm.ema_gamma));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.ema_wq));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.ema_wk));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.ema_wv));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.ema_wo));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.q_norm.ema_gamma));
+        try f.writeAll(std.mem.sliceAsBytes(layer.attn.k_norm.ema_gamma));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn_norm.ema_gamma));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn.ema_w1));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn.ema_w2));
+        try f.writeAll(std.mem.sliceAsBytes(layer.ffn.ema_w3));
+    }
+    try f.writeAll(std.mem.sliceAsBytes(m.out_norm.ema_gamma));
+    try f.writeAll(std.mem.sliceAsBytes(m.out_proj.ema_weights));
 }
 
 fn loadModel(path: []const u8, m: *Model) !void {
     const f = try std.fs.cwd().openFile(path, .{});
     defer f.close();
+    // Load training weights
     _ = try f.readAll(std.mem.sliceAsBytes(m.emb.weights));
     for (&m.layers) |*layer| {
         _ = try f.readAll(std.mem.sliceAsBytes(layer.attn_norm.gamma));
@@ -764,6 +1103,8 @@ fn loadModel(path: []const u8, m: *Model) !void {
         _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.wk));
         _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.wv));
         _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.wo));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.q_norm.gamma));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.k_norm.gamma));
         _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn_norm.gamma));
         _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.w1));
         _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.w2));
@@ -771,8 +1112,96 @@ fn loadModel(path: []const u8, m: *Model) !void {
     }
     _ = try f.readAll(std.mem.sliceAsBytes(m.out_norm.gamma));
     _ = try f.readAll(std.mem.sliceAsBytes(m.out_proj.weights));
+    // Load EMA weights (for generation)
+    _ = try f.readAll(std.mem.sliceAsBytes(m.emb.ema_weights));
+    for (&m.layers) |*layer| {
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn_norm.ema_gamma));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.ema_wq));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.ema_wk));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.ema_wv));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.ema_wo));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.q_norm.ema_gamma));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.attn.k_norm.ema_gamma));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn_norm.ema_gamma));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.ema_w1));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.ema_w2));
+        _ = try f.readAll(std.mem.sliceAsBytes(layer.ffn.ema_w3));
+    }
+    _ = try f.readAll(std.mem.sliceAsBytes(m.out_norm.ema_gamma));
+    _ = try f.readAll(std.mem.sliceAsBytes(m.out_proj.ema_weights));
 }
 
+// Quick generation sample for monitoring training progress (uses stack buffers)
+fn generateSample(m: *Model, prompt: []const u8, max_tok: usize, rand: std.Random) void {
+    var x: [CONTEXT * D_MODEL]f32 = undefined;
+    var x_norm: [CONTEXT * D_MODEL]f32 = undefined;
+    var attn_out: [CONTEXT * D_MODEL]f32 = undefined;
+    var ffn_out: [CONTEXT * D_MODEL]f32 = undefined;
+    var q: [CONTEXT * D_HEAD]f32 = undefined;
+    var k: [CONTEXT * D_HEAD]f32 = undefined;
+    var v: [CONTEXT * D_HEAD]f32 = undefined;
+    var scores: [CONTEXT * CONTEXT]f32 = undefined;
+    var gate: [CONTEXT * D_FFN]f32 = undefined;
+    var up: [CONTEXT * D_FFN]f32 = undefined;
+    var logits: [VOCAB_SIZE]f32 = undefined;
+
+    var history: [256]u8 = undefined;
+    var hist_len: usize = 0;
+    for (prompt) |ch| {
+        if (hist_len < 256) { history[hist_len] = ch; hist_len += 1; }
+    }
+
+    std.debug.print("  \"{s}", .{prompt});
+
+    for (0..max_tok) |_| {
+        const seq_start = if (hist_len > CONTEXT) hist_len - CONTEXT else 0;
+        const seq_len = hist_len - seq_start;
+        const context = history[seq_start..hist_len];
+
+        m.emb.gatherEMA(context, x[0 .. seq_len * D_MODEL]);
+
+        for (&m.layers) |*layer| {
+            @memcpy(x_norm[0 .. seq_len * D_MODEL], x[0 .. seq_len * D_MODEL]);
+            layer.attn_norm.forwardEMA(x_norm[0 .. seq_len * D_MODEL], seq_len);
+            layer.attn.forwardEMA(x_norm[0 .. seq_len * D_MODEL], attn_out[0 .. seq_len * D_MODEL],
+                q[0 .. seq_len * D_HEAD], k[0 .. seq_len * D_HEAD], v[0 .. seq_len * D_HEAD],
+                scores[0 .. seq_len * seq_len], seq_len);
+            for (0..seq_len * D_MODEL) |i| x[i] += attn_out[i];
+
+            @memcpy(x_norm[0 .. seq_len * D_MODEL], x[0 .. seq_len * D_MODEL]);
+            layer.ffn_norm.forwardEMA(x_norm[0 .. seq_len * D_MODEL], seq_len);
+            layer.ffn.forwardEMA(x_norm[0 .. seq_len * D_MODEL], ffn_out[0 .. seq_len * D_MODEL],
+                gate[0 .. seq_len * D_FFN], up[0 .. seq_len * D_FFN], seq_len);
+            for (0..seq_len * D_MODEL) |i| x[i] += ffn_out[i];
+        }
+
+        const last_pos = (seq_len - 1) * D_MODEL;
+        var last_hidden: [D_MODEL]f32 = undefined;
+        @memcpy(&last_hidden, x[last_pos..][0..D_MODEL]);
+        m.out_norm.forwardEMA(&last_hidden, 1);
+        m.out_proj.forwardEMA(&last_hidden, &logits, 1);
+
+        // Simple temperature + top-k sampling
+        const temp: f32 = 0.9;
+        var max_v: f32 = logits[0];
+        for (&logits) |l| max_v = @max(max_v, l);
+        var sum: f32 = 0;
+        for (&logits) |*l| { l.* = @exp((l.* - max_v) / temp); sum += l.*; }
+        for (&logits) |*l| l.* /= sum;
+
+        var r = rand.float(f32);
+        var next: u8 = 0;
+        for (logits, 0..) |p, i| { r -= p; if (r <= 0) { next = @intCast(i); break; } }
+
+        if (next >= 32 and next < 127) std.debug.print("{c}", .{next})
+        else if (next == '\n') { std.debug.print("\\n", .{}); }
+
+        if (hist_len < 256) { history[hist_len] = next; hist_len += 1; }
+    }
+    std.debug.print("\"\n", .{});
+}
+
+// Generation uses EMA weights for smoother, better quality output
 fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Allocator) !void {
     var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
 
@@ -813,46 +1242,79 @@ fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Alloca
         const seq_len = hist_len - seq_start;
         const context = history[seq_start..hist_len];
 
-        // Embedding
-        m.emb.gather(context, x[0 .. seq_len * D_MODEL]);
+        // Embedding using EMA weights
+        m.emb.gatherEMA(context, x[0 .. seq_len * D_MODEL]);
 
-        // Process through all transformer layers
+        // Process through all transformer layers using EMA weights
         var x_norm: [CONTEXT * D_MODEL]f32 = undefined;
         for (&m.layers) |*layer| {
-            // Pre-norm + Attention + Residual
+            // Pre-norm + Attention + Residual (using EMA)
             @memcpy(x_norm[0 .. seq_len * D_MODEL], x[0 .. seq_len * D_MODEL]);
-            layer.attn_norm.forward(x_norm[0 .. seq_len * D_MODEL], seq_len);
-            layer.attn.forward(x_norm[0 .. seq_len * D_MODEL], attn_out[0 .. seq_len * D_MODEL],
+            layer.attn_norm.forwardEMA(x_norm[0 .. seq_len * D_MODEL], seq_len);
+            layer.attn.forwardEMA(x_norm[0 .. seq_len * D_MODEL], attn_out[0 .. seq_len * D_MODEL],
                            q[0 .. seq_len * D_HEAD], k[0 .. seq_len * D_HEAD], v[0 .. seq_len * D_HEAD],
                            scores[0 .. seq_len * seq_len], seq_len);
             for (0..seq_len * D_MODEL) |i| x[i] += attn_out[i]; // Residual
 
-            // Pre-norm + FFN + Residual
+            // Pre-norm + FFN + Residual (using EMA)
             @memcpy(x_norm[0 .. seq_len * D_MODEL], x[0 .. seq_len * D_MODEL]);
-            layer.ffn_norm.forward(x_norm[0 .. seq_len * D_MODEL], seq_len);
-            layer.ffn.forward(x_norm[0 .. seq_len * D_MODEL], ffn_out[0 .. seq_len * D_MODEL],
+            layer.ffn_norm.forwardEMA(x_norm[0 .. seq_len * D_MODEL], seq_len);
+            layer.ffn.forwardEMA(x_norm[0 .. seq_len * D_MODEL], ffn_out[0 .. seq_len * D_MODEL],
                           gate[0 .. seq_len * D_FFN], up[0 .. seq_len * D_FFN], seq_len);
             for (0..seq_len * D_MODEL) |i| x[i] += ffn_out[i]; // Residual
         }
 
-        // Output: last position only
+        // Output: last position only (using EMA)
         const last_pos = (seq_len - 1) * D_MODEL;
         var last_hidden: [D_MODEL]f32 = undefined;
         @memcpy(&last_hidden, x[last_pos..][0..D_MODEL]);
-        m.out_norm.forward(&last_hidden, 1);
-        m.out_proj.forward(&last_hidden, logits, 1);
+        m.out_norm.forwardEMA(&last_hidden, 1);
+        m.out_proj.forwardEMA(&last_hidden, logits, 1);
 
-        // Temperature sampling
+        // Repetition penalty: reduce probability of recently generated tokens
+        const rep_penalty: f32 = 1.2;
+        const rep_window: usize = 32;
+        const window_start = if (hist_len > rep_window) hist_len - rep_window else 0;
+        for (history[window_start..hist_len]) |recent| {
+            logits[recent] /= rep_penalty;
+        }
+
+        // Temperature scaling
+        const temp: f32 = 0.8;
         var max_v: f32 = logits[0];
         for (logits) |l| max_v = @max(max_v, l);
-        var sum: f32 = 0;
-        const temp: f32 = 0.8; // Temperature for sampling
-        for (logits) |*l| { l.* = @exp((l.* - max_v) / temp); sum += l.*; }
-        for (logits) |*l| l.* /= sum;
+        for (logits) |*l| l.* = @exp((l.* - max_v) / temp);
 
-        var r = prng.random().float(f32);
-        var next: u8 = 0;
-        for (logits, 0..) |p, i| { r -= p; if (r <= 0) { next = @intCast(i); break; } }
+        // Top-k sampling: only consider top k tokens
+        const top_k: usize = 40;
+        var indices: [VOCAB_SIZE]usize = undefined;
+        for (0..VOCAB_SIZE) |i| indices[i] = i;
+
+        // Partial sort to find top-k (simple selection)
+        for (0..top_k) |i| {
+            var max_idx = i;
+            for (i + 1..VOCAB_SIZE) |j| {
+                if (logits[indices[j]] > logits[indices[max_idx]]) max_idx = j;
+            }
+            const tmp = indices[i];
+            indices[i] = indices[max_idx];
+            indices[max_idx] = tmp;
+        }
+
+        // Renormalize over top-k only
+        var sum: f32 = 0;
+        for (indices[0..top_k]) |idx| sum += logits[idx];
+
+        // Sample from top-k
+        var r = prng.random().float(f32) * sum;
+        var next: u8 = @intCast(indices[0]);
+        for (indices[0..top_k]) |idx| {
+            r -= logits[idx];
+            if (r <= 0) {
+                next = @intCast(idx);
+                break;
+            }
+        }
 
         if (next >= 32 and next < 127) std.debug.print("{c}", .{next})
         else if (next == '\n') std.debug.print("\n", .{});
@@ -905,8 +1367,14 @@ pub fn main() !void {
     const data = try std.posix.mmap(null, size, std.posix.PROT.READ, .{ .TYPE = .SHARED }, file.handle, 0);
     defer std.posix.munmap(data);
 
+    // Validation split
+    const train_size = @as(usize, @intFromFloat(@as(f32, @floatFromInt(size)) * (1.0 - VAL_RATIO)));
+    const val_size = size - train_size;
+
     std.debug.print("Modern Transformer | ctx={d} | d={d} | RoPE + RMSNorm + SwiGLU\n", .{CONTEXT, D_MODEL});
-    std.debug.print("Loaded {d:.1}MB | {d} steps | cosine LR schedule\n", .{@as(f32, @floatFromInt(size)) / 1e6, MAX_STEPS});
+    std.debug.print("Train: {d:.1}MB | Val: {d:.1}MB | {d} steps | dropout={d:.1} | smooth={d:.1}\n",
+        .{@as(f32, @floatFromInt(train_size)) / 1e6, @as(f32, @floatFromInt(val_size)) / 1e6,
+          MAX_STEPS, DROPOUT_ATTN, LABEL_SMOOTHING});
 
     // Training buffers
     const tokens = try alloc.alloc(u8, BATCH_SIZE * CONTEXT);
@@ -915,6 +1383,20 @@ pub fn main() !void {
     defer alloc.free(targets);
     const x = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
     defer alloc.free(x);
+
+    // Dropout masks
+    var dropout_attn_mask: [N_LAYERS][]f32 = undefined;
+    var dropout_ffn_mask: [N_LAYERS][]f32 = undefined;
+    for (0..N_LAYERS) |l| {
+        dropout_attn_mask[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+        dropout_ffn_mask[l] = try alloc.alloc(f32, BATCH_SIZE * CONTEXT * D_MODEL);
+    }
+    defer {
+        for (0..N_LAYERS) |l| {
+            alloc.free(dropout_attn_mask[l]);
+            alloc.free(dropout_ffn_mask[l]);
+        }
+    }
 
     // Per-layer intermediate buffers (needed for backward pass)
     // x_orig_*: original input before normalization (for norm backward)
@@ -988,13 +1470,18 @@ pub fn main() !void {
     var loss_sum: f32 = 0;
     var loss_count: usize = 0;
 
+    // Early stopping state
+    var best_val_loss: f32 = std.math.inf(f32);
+    var patience_counter: usize = 0;
+    var val_loss: f32 = 0;
+
     var step: usize = 0;
     while (step < MAX_STEPS) : (step += 1) {
         const seq_len = CONTEXT;
 
-        // Sample random sequences
+        // Sample random sequences from TRAINING data only
         for (0..BATCH_SIZE) |b| {
-            const pos = rand.uintLessThan(usize, size - CONTEXT - 1);
+            const pos = rand.uintLessThan(usize, train_size - CONTEXT - 1);
             for (0..seq_len) |t| {
                 tokens[b * seq_len + t] = data[pos + t];
                 targets[b * seq_len + t] = data[pos + t + 1];
@@ -1027,6 +1514,8 @@ pub fn main() !void {
                     seq_len
                 );
             }
+            // Apply dropout to attention output
+            applyDropout(attn_out[l][0 .. n * D_MODEL], dropout_attn_mask[l][0 .. n * D_MODEL], DROPOUT_ATTN, rand);
             for (0..n * D_MODEL) |i| x[i] += attn_out[l][i];
 
             // Save original x before ffn_norm (for backward)
@@ -1041,6 +1530,8 @@ pub fn main() !void {
                 @intCast(n), @intCast(D_FFN), @intCast(D_MODEL),
                 1.0, x_normed_ffn[l].ptr, @intCast(D_MODEL), model.layers[l].ffn.w1.ptr, @intCast(D_MODEL),
                 0.0, gate_pre[l].ptr, @intCast(D_FFN));
+            // Apply dropout to FFN output
+            applyDropout(ffn_out[l][0 .. n * D_MODEL], dropout_ffn_mask[l][0 .. n * D_MODEL], DROPOUT_FFN, rand);
             for (0..n * D_MODEL) |i| x[i] += ffn_out[l][i];
         }
 
@@ -1049,13 +1540,14 @@ pub fn main() !void {
         model.out_norm.forward(x_out[0 .. n * D_MODEL], n);
         model.out_proj.forward(x_out[0 .. n * D_MODEL], logits[0 .. n * VOCAB_SIZE], n);
 
-        const loss = softmaxCE(logits[0 .. n * VOCAB_SIZE], targets[0..n], n);
+        // Use label smoothing for better regularization
+        const loss = softmaxCESmoothed(logits[0 .. n * VOCAB_SIZE], targets[0..n], n, LABEL_SMOOTHING);
         loss_sum += loss;
         loss_count += 1;
         total_tokens += n;
 
-        // Backward pass
-        softmaxBackward(logits[0 .. n * VOCAB_SIZE], targets[0..n], logits_grad[0 .. n * VOCAB_SIZE], n);
+        // Backward pass with label smoothing
+        softmaxBackwardSmoothed(logits[0 .. n * VOCAB_SIZE], targets[0..n], logits_grad[0 .. n * VOCAB_SIZE], n, LABEL_SMOOTHING);
 
         // Output projection backward
         model.out_proj.backward(x_out[0 .. n * D_MODEL], logits_grad[0 .. n * VOCAB_SIZE], x_grad[0 .. n * D_MODEL], n);
@@ -1068,6 +1560,8 @@ pub fn main() !void {
 
             // FFN backward (gradient flows through residual)
             @memcpy(layer_grad[0 .. n * D_MODEL], x_grad[0 .. n * D_MODEL]);
+            // Apply dropout backward (multiply by same mask)
+            applyDropoutBackward(layer_grad[0 .. n * D_MODEL], dropout_ffn_mask[l][0 .. n * D_MODEL]);
             // ffn.backward uses the normalized input (x_normed_ffn)
             model.layers[l].ffn.backward(x_normed_ffn[l][0 .. n * D_MODEL], layer_grad[0 .. n * D_MODEL], layer_in_grad[0 .. n * D_MODEL],
                                gate_pre[l][0 .. n * D_FFN], up_buf[l][0 .. n * D_FFN], gate_buf[l][0 .. n * D_FFN], n);
@@ -1077,6 +1571,8 @@ pub fn main() !void {
 
             // Attention backward
             @memcpy(layer_grad[0 .. n * D_MODEL], x_grad[0 .. n * D_MODEL]);
+            // Apply dropout backward
+            applyDropoutBackward(layer_grad[0 .. n * D_MODEL], dropout_attn_mask[l][0 .. n * D_MODEL]);
             for (0..BATCH_SIZE) |b| {
                 const offset = b * seq_len;
                 // attn.backward uses the normalized input (x_normed_attn)
@@ -1115,13 +1611,78 @@ pub fn main() !void {
             const elapsed = @as(f32, @floatFromInt(std.time.milliTimestamp() - start)) / 1000.0;
             const avg_loss = loss_sum / @as(f32, @floatFromInt(loss_count));
             const tps = @as(f32, @floatFromInt(total_tokens)) / elapsed;
-            std.debug.print("\x1b[2J\x1b[HStep: {d}/{d} | Loss: {d:.3} | TPS: {d:.0}K | LR: {d:.6}\n",
-                          .{step, MAX_STEPS, avg_loss, tps/1000, getLR(step)});
+            std.debug.print("\x1b[2J\x1b[HStep: {d}/{d} | Train: {d:.3} | Val: {d:.3} | TPS: {d:.0}K | LR: {d:.6}\n",
+                          .{step, MAX_STEPS, avg_loss, val_loss, tps/1000, getLR(step)});
             loss_sum = 0;
             loss_count = 0;
+        }
+
+        // Validation and early stopping every 500 steps
+        if (step > 0 and step % 500 == 0) {
+            // Compute validation loss (sample from validation set, no dropout)
+            var val_loss_sum: f32 = 0;
+            const val_batches: usize = 10;
+            for (0..val_batches) |_| {
+                for (0..BATCH_SIZE) |b| {
+                    const val_pos = train_size + rand.uintLessThan(usize, val_size - CONTEXT - 1);
+                    for (0..seq_len) |t| {
+                        tokens[b * seq_len + t] = data[val_pos + t];
+                        targets[b * seq_len + t] = data[val_pos + t + 1];
+                    }
+                }
+                // Forward pass without dropout (use EMA weights for cleaner eval)
+                model.emb.gatherEMA(tokens[0..n], x[0 .. n * D_MODEL]);
+                for (0..N_LAYERS) |vl| {
+                    @memcpy(x_normed_attn[vl][0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+                    model.layers[vl].attn_norm.forwardEMA(x_normed_attn[vl][0 .. n * D_MODEL], n);
+                    for (0..BATCH_SIZE) |vb| {
+                        const offset = vb * seq_len;
+                        model.layers[vl].attn.forwardEMA(
+                            x_normed_attn[vl][offset * D_MODEL ..][0 .. seq_len * D_MODEL],
+                            attn_out[vl][offset * D_MODEL ..][0 .. seq_len * D_MODEL],
+                            q_buf[vl][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                            k_buf[vl][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                            v_buf[vl][offset * D_HEAD ..][0 .. seq_len * D_HEAD],
+                            scores_buf[vl][vb * seq_len * seq_len ..][0 .. seq_len * seq_len],
+                            seq_len
+                        );
+                    }
+                    for (0..n * D_MODEL) |i| x[i] += attn_out[vl][i];
+                    @memcpy(x_normed_ffn[vl][0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+                    model.layers[vl].ffn_norm.forwardEMA(x_normed_ffn[vl][0 .. n * D_MODEL], n);
+                    model.layers[vl].ffn.forwardEMA(x_normed_ffn[vl][0 .. n * D_MODEL], ffn_out[vl][0 .. n * D_MODEL],
+                                      gate_buf[vl][0 .. n * D_FFN], up_buf[vl][0 .. n * D_FFN], n);
+                    for (0..n * D_MODEL) |i| x[i] += ffn_out[vl][i];
+                }
+                @memcpy(x_out[0 .. n * D_MODEL], x[0 .. n * D_MODEL]);
+                model.out_norm.forwardEMA(x_out[0 .. n * D_MODEL], n);
+                model.out_proj.forwardEMA(x_out[0 .. n * D_MODEL], logits[0 .. n * VOCAB_SIZE], n);
+                val_loss_sum += softmaxCE(logits[0 .. n * VOCAB_SIZE], targets[0..n], n);
+            }
+            val_loss = val_loss_sum / @as(f32, @floatFromInt(val_batches));
+
+            // Show a generation sample to monitor quality
+            std.debug.print("Sample:", .{});
+            generateSample(&model, "Hello", 32, rand);
+            std.debug.print("\n", .{});
+
+            // Early stopping check
+            if (val_loss < best_val_loss) {
+                best_val_loss = val_loss;
+                patience_counter = 0;
+                try saveModel("model_best.bin", &model);
+            } else {
+                patience_counter += 1;
+                if (patience_counter >= PATIENCE) {
+                    std.debug.print("\nEarly stopping at step {d} (val_loss: {d:.3}, best: {d:.3})\n",
+                        .{step, val_loss, best_val_loss});
+                    break;
+                }
+            }
         }
     }
 
     try saveModel("model.bin", &model);
-    std.debug.print("\nTraining complete. Model saved to model.bin\n", .{});
+    std.debug.print("\nTraining complete. Best val_loss: {d:.3}\n", .{best_val_loss});
+    std.debug.print("Models saved: model.bin (final), model_best.bin (best)\n", .{});
 }
