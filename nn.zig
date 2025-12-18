@@ -1413,8 +1413,6 @@ fn generateSample(m: *Model, prompt: []const u8, max_tok: usize, rand: std.Rando
 
 // Generation uses EMA weights for smoother, better quality output
 fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Allocator) !void {
-    var prng = std.Random.DefaultPrng.init(@intCast(std.time.timestamp()));
-
     const x = try alloc.alloc(f32, CONTEXT * D_MODEL);
     defer alloc.free(x);
     const attn_out = try alloc.alloc(f32, CONTEXT * D_MODEL);
@@ -1492,53 +1490,13 @@ fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Alloca
             logits[recent] /= rep_penalty;
         }
 
-        // Word-Boundary Greedy: use greedy at word starts, low temp within words
-        // This prevents character-level errors from cascading into gibberish
-        const last_char: u8 = if (hist_len > 0) history[hist_len - 1] else ' ';
-        const at_word_start = (last_char == ' ' or last_char == '\n');
-
-        var next: u8 = 0;
-
-        if (at_word_start) {
-            // Greedy decoding for first char of word - ensures coherent word starts
-            var max_idx: usize = 0;
-            var max_val: f32 = logits[0];
-            for (logits, 0..) |l, i| {
-                if (l > max_val) { max_val = l; max_idx = i; }
-            }
-            next = @intCast(max_idx);
-        } else {
-            // Low temperature within words for coherent spelling
-            const temp: f32 = 0.4;
-            var max_v: f32 = logits[0];
-            for (logits) |l| max_v = @max(max_v, l);
-            for (logits) |*l| l.* = @exp((l.* - max_v) / temp);
-
-            // Top-k=5 for tight distribution
-            const top_k: usize = 5;
-            var indices: [VOCAB_SIZE]usize = undefined;
-            for (0..VOCAB_SIZE) |i| indices[i] = i;
-
-            for (0..top_k) |i| {
-                var max_idx = i;
-                for (i + 1..VOCAB_SIZE) |j| {
-                    if (logits[indices[j]] > logits[indices[max_idx]]) max_idx = j;
-                }
-                const tmp = indices[i];
-                indices[i] = indices[max_idx];
-                indices[max_idx] = tmp;
-            }
-
-            var sum: f32 = 0;
-            for (indices[0..top_k]) |idx| sum += logits[idx];
-
-            var r = prng.random().float(f32) * sum;
-            next = @intCast(indices[0]);
-            for (indices[0..top_k]) |idx| {
-                r -= logits[idx];
-                if (r <= 0) { next = @intCast(idx); break; }
-            }
+        // Fully greedy decoding for maximum coherence
+        var max_idx: usize = 0;
+        var max_val: f32 = logits[0];
+        for (logits, 0..) |l, i| {
+            if (l > max_val) { max_val = l; max_idx = i; }
         }
+        const next: u8 = @intCast(max_idx);
 
         if (next >= 32 and next < 127) std.debug.print("{c}", .{next})
         else if (next == '\n') std.debug.print("\n", .{});
