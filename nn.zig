@@ -1484,48 +1484,59 @@ fn generate(m: *Model, prompt: []const u8, max_tok: usize, alloc: std.mem.Alloca
         // Use first horizon (t+1) for generation
         const logits = fused_logits[0..VOCAB_SIZE];
 
-        // Repetition penalty: reduce probability of recently generated tokens
-        const rep_penalty: f32 = 1.2;
+        // Repetition penalty: mild to avoid breaking coherence
+        const rep_penalty: f32 = 1.15;
         const rep_window: usize = 32;
         const window_start = if (hist_len > rep_window) hist_len - rep_window else 0;
         for (history[window_start..hist_len]) |recent| {
             logits[recent] /= rep_penalty;
         }
 
-        // Temperature scaling
-        const temp: f32 = 0.8;
-        var max_v: f32 = logits[0];
-        for (logits) |l| max_v = @max(max_v, l);
-        for (logits) |*l| l.* = @exp((l.* - max_v) / temp);
+        // Word-Boundary Greedy: use greedy at word starts, low temp within words
+        // This prevents character-level errors from cascading into gibberish
+        const last_char: u8 = if (hist_len > 0) history[hist_len - 1] else ' ';
+        const at_word_start = (last_char == ' ' or last_char == '\n');
 
-        // Top-k sampling: only consider top k tokens
-        const top_k: usize = 40;
-        var indices: [VOCAB_SIZE]usize = undefined;
-        for (0..VOCAB_SIZE) |i| indices[i] = i;
+        var next: u8 = 0;
 
-        // Partial sort to find top-k (simple selection)
-        for (0..top_k) |i| {
-            var max_idx = i;
-            for (i + 1..VOCAB_SIZE) |j| {
-                if (logits[indices[j]] > logits[indices[max_idx]]) max_idx = j;
+        if (at_word_start) {
+            // Greedy decoding for first char of word - ensures coherent word starts
+            var max_idx: usize = 0;
+            var max_val: f32 = logits[0];
+            for (logits, 0..) |l, i| {
+                if (l > max_val) { max_val = l; max_idx = i; }
             }
-            const tmp = indices[i];
-            indices[i] = indices[max_idx];
-            indices[max_idx] = tmp;
-        }
+            next = @intCast(max_idx);
+        } else {
+            // Low temperature within words for coherent spelling
+            const temp: f32 = 0.4;
+            var max_v: f32 = logits[0];
+            for (logits) |l| max_v = @max(max_v, l);
+            for (logits) |*l| l.* = @exp((l.* - max_v) / temp);
 
-        // Renormalize over top-k only
-        var sum: f32 = 0;
-        for (indices[0..top_k]) |idx| sum += logits[idx];
+            // Top-k=5 for tight distribution
+            const top_k: usize = 5;
+            var indices: [VOCAB_SIZE]usize = undefined;
+            for (0..VOCAB_SIZE) |i| indices[i] = i;
 
-        // Sample from top-k
-        var r = prng.random().float(f32) * sum;
-        var next: u8 = @intCast(indices[0]);
-        for (indices[0..top_k]) |idx| {
-            r -= logits[idx];
-            if (r <= 0) {
-                next = @intCast(idx);
-                break;
+            for (0..top_k) |i| {
+                var max_idx = i;
+                for (i + 1..VOCAB_SIZE) |j| {
+                    if (logits[indices[j]] > logits[indices[max_idx]]) max_idx = j;
+                }
+                const tmp = indices[i];
+                indices[i] = indices[max_idx];
+                indices[max_idx] = tmp;
+            }
+
+            var sum: f32 = 0;
+            for (indices[0..top_k]) |idx| sum += logits[idx];
+
+            var r = prng.random().float(f32) * sum;
+            next = @intCast(indices[0]);
+            for (indices[0..top_k]) |idx| {
+                r -= logits[idx];
+                if (r <= 0) { next = @intCast(idx); break; }
             }
         }
 
