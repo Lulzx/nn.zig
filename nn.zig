@@ -7,19 +7,18 @@ const c = @cImport({
 // Based on LLaMA: RMSNorm, RoPE, SwiGLU, Single-head Attention
 const VOCAB_SIZE: usize = 256;
 const CONTEXT: usize = 64;
-const D_MODEL: usize = 128; // 2x larger embedding
-const D_HEAD: usize = 128; // Match D_MODEL
-const D_FFN: usize = 512; // 4x D_MODEL (LLaMA ratio)
-const BATCH_SIZE: usize = 32; // Smaller batch for larger model
+const D_MODEL: usize = 256; // Larger embedding
+const D_HEAD: usize = 256; // Match D_MODEL
+const D_FFN: usize = 1024; // 4x D_MODEL
+const BATCH_SIZE: usize = 16; // Smaller batch for larger model
 
-const BASE_LR: f32 = 0.0006; // Higher LR for faster convergence
-const WARMUP_STEPS: usize = 200;
-const MAX_STEPS: usize = 20000;
+const BASE_LR: f32 = 0.001; // Muon LR (tuned for this model)
+const WARMUP_STEPS: usize = 500;
+const MAX_STEPS: usize = 30000;
 const GRAD_CLIP: f32 = 1.0; // Gradient clipping
-const BETA1: f32 = 0.9;
-const BETA2: f32 = 0.95; // LLaMA uses 0.95
+const MUON_MOMENTUM: f32 = 0.95; // Muon momentum
 const EPSILON: f32 = 1e-8;
-const WEIGHT_DECAY: f32 = 0.1; // AdamW weight decay
+const WEIGHT_DECAY: f32 = 0.01; // Lower weight decay for Muon
 
 // Cosine LR schedule with warmup
 fn getLR(step: usize) f32 {
@@ -92,15 +91,16 @@ const RMSNorm = struct {
 
     pub fn applyGradients(self: *RMSNorm, step: usize) void {
         const lr = getLR(step);
-        const t = @as(f32, @floatFromInt(step + 1));
-        const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
-        const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
+
+        // Muon: normalize gradients by RMS, then apply momentum
+        var rms: f32 = 0;
+        for (self.grad) |g| rms += g * g;
+        rms = @sqrt(rms / @as(f32, @floatFromInt(self.dim)) + EPSILON);
 
         for (0..self.dim) |i| {
-            const g = self.grad[i];
-            self.m[i] = BETA1 * self.m[i] + (1 - BETA1) * g;
-            self.v[i] = BETA2 * self.v[i] + (1 - BETA2) * g * g;
-            self.gamma[i] -= lr * (self.m[i] / bc1) / (@sqrt(self.v[i] / bc2) + EPSILON);
+            const g_norm = self.grad[i] / rms;
+            self.m[i] = MUON_MOMENTUM * self.m[i] + g_norm;
+            self.gamma[i] -= lr * self.m[i];
         }
         @memset(self.grad, 0);
     }
@@ -319,26 +319,33 @@ const Attention = struct {
 
     pub fn applyGradients(self: *Attention, step: usize) void {
         const lr = getLR(step);
-        const t = @as(f32, @floatFromInt(step + 1));
-        const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
-        const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
-        const size = self.dim * self.dim;
 
+        // Muon: normalize gradients per-row (per output neuron)
         inline for (.{
-            .{ self.wq, self.m_q, self.v_q, self.grad_q },
-            .{ self.wk, self.m_k, self.v_k, self.grad_k },
-            .{ self.wv, self.m_v, self.v_v, self.grad_v },
-            .{ self.wo, self.m_o, self.v_o, self.grad_o },
+            .{ self.wq, self.m_q, self.grad_q },
+            .{ self.wk, self.m_k, self.grad_k },
+            .{ self.wv, self.m_v, self.grad_v },
+            .{ self.wo, self.m_o, self.grad_o },
         }) |params| {
             const w = params[0];
             const m = params[1];
-            const vv = params[2];
-            const grad = params[3];
-            for (0..size) |i| {
-                const g = grad[i] + WEIGHT_DECAY * w[i];
-                m[i] = BETA1 * m[i] + (1 - BETA1) * g;
-                vv[i] = BETA2 * vv[i] + (1 - BETA2) * g * g;
-                w[i] -= lr * (m[i] / bc1) / (@sqrt(vv[i] / bc2) + EPSILON);
+            const grad = params[2];
+
+            // Compute per-row RMS and apply Muon update
+            for (0..self.dim) |row| {
+                var rms: f32 = 0;
+                for (0..self.dim) |col| {
+                    const g = grad[row * self.dim + col];
+                    rms += g * g;
+                }
+                rms = @sqrt(rms / @as(f32, @floatFromInt(self.dim)) + EPSILON);
+
+                for (0..self.dim) |col| {
+                    const idx = row * self.dim + col;
+                    const g_norm = grad[idx] / rms;
+                    m[idx] = MUON_MOMENTUM * m[idx] + g_norm;
+                    w[idx] -= lr * (m[idx] + WEIGHT_DECAY * w[idx]);
+                }
             }
             @memset(grad, 0);
         }
@@ -467,28 +474,51 @@ const SwiGLU = struct {
 
     pub fn applyGradients(self: *SwiGLU, step: usize) void {
         const lr = getLR(step);
-        const t = @as(f32, @floatFromInt(step + 1));
-        const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
-        const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
 
+        // Muon for w1, w2 (hidden_dim x in_dim)
         inline for (.{
-            .{ self.w1, self.m1, self.v1, self.grad1, self.hidden_dim * self.in_dim },
-            .{ self.w2, self.m2, self.v2, self.grad2, self.hidden_dim * self.in_dim },
-            .{ self.w3, self.m3, self.v3, self.grad3, self.in_dim * self.hidden_dim },
+            .{ self.w1, self.m1, self.grad1 },
+            .{ self.w2, self.m2, self.grad2 },
         }) |params| {
             const w = params[0];
             const m = params[1];
-            const vv = params[2];
-            const grad = params[3];
-            const size = params[4];
-            for (0..size) |i| {
-                const g = grad[i] + WEIGHT_DECAY * w[i];
-                m[i] = BETA1 * m[i] + (1 - BETA1) * g;
-                vv[i] = BETA2 * vv[i] + (1 - BETA2) * g * g;
-                w[i] -= lr * (m[i] / bc1) / (@sqrt(vv[i] / bc2) + EPSILON);
+            const grad = params[2];
+
+            for (0..self.hidden_dim) |row| {
+                var rms: f32 = 0;
+                for (0..self.in_dim) |col| {
+                    const g = grad[row * self.in_dim + col];
+                    rms += g * g;
+                }
+                rms = @sqrt(rms / @as(f32, @floatFromInt(self.in_dim)) + EPSILON);
+
+                for (0..self.in_dim) |col| {
+                    const idx = row * self.in_dim + col;
+                    const g_norm = grad[idx] / rms;
+                    m[idx] = MUON_MOMENTUM * m[idx] + g_norm;
+                    w[idx] -= lr * (m[idx] + WEIGHT_DECAY * w[idx]);
+                }
             }
             @memset(grad, 0);
         }
+
+        // Muon for w3 (in_dim x hidden_dim)
+        for (0..self.in_dim) |row| {
+            var rms: f32 = 0;
+            for (0..self.hidden_dim) |col| {
+                const g = self.grad3[row * self.hidden_dim + col];
+                rms += g * g;
+            }
+            rms = @sqrt(rms / @as(f32, @floatFromInt(self.hidden_dim)) + EPSILON);
+
+            for (0..self.hidden_dim) |col| {
+                const idx = row * self.hidden_dim + col;
+                const g_norm = self.grad3[idx] / rms;
+                self.m3[idx] = MUON_MOMENTUM * self.m3[idx] + g_norm;
+                self.w3[idx] -= lr * (self.m3[idx] + WEIGHT_DECAY * self.w3[idx]);
+            }
+        }
+        @memset(self.grad3, 0);
     }
 };
 
@@ -533,15 +563,22 @@ pub const Embedding = struct {
 
     pub fn applyGradients(self: *Embedding, step: usize) void {
         const lr = getLR(step);
-        const t = @as(f32, @floatFromInt(step + 1));
-        const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
-        const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
 
-        for (0..self.vocab * self.dim) |i| {
-            const g = self.grad[i];
-            self.m[i] = BETA1 * self.m[i] + (1 - BETA1) * g;
-            self.v[i] = BETA2 * self.v[i] + (1 - BETA2) * g * g;
-            self.weights[i] -= lr * (self.m[i] / bc1) / (@sqrt(self.v[i] / bc2) + EPSILON);
+        // Muon: normalize per vocabulary token (per row)
+        for (0..self.vocab) |row| {
+            var rms: f32 = 0;
+            for (0..self.dim) |col| {
+                const g = self.grad[row * self.dim + col];
+                rms += g * g;
+            }
+            rms = @sqrt(rms / @as(f32, @floatFromInt(self.dim)) + EPSILON);
+
+            for (0..self.dim) |col| {
+                const idx = row * self.dim + col;
+                const g_norm = self.grad[idx] / rms;
+                self.m[idx] = MUON_MOMENTUM * self.m[idx] + g_norm;
+                self.weights[idx] -= lr * self.m[idx];
+            }
         }
         @memset(self.grad, 0);
     }
@@ -591,16 +628,22 @@ pub const Linear = struct {
 
     pub fn applyGradients(self: *Linear, step: usize) void {
         const lr = getLR(step);
-        const t = @as(f32, @floatFromInt(step + 1));
-        const bc1 = 1.0 - std.math.pow(f32, BETA1, t);
-        const bc2 = 1.0 - std.math.pow(f32, BETA2, t);
-        const size = self.in_dim * self.out_dim;
 
-        for (0..size) |i| {
-            const g = self.grad[i] + WEIGHT_DECAY * self.weights[i];
-            self.m[i] = BETA1 * self.m[i] + (1 - BETA1) * g;
-            self.v[i] = BETA2 * self.v[i] + (1 - BETA2) * g * g;
-            self.weights[i] -= lr * (self.m[i] / bc1) / (@sqrt(self.v[i] / bc2) + EPSILON);
+        // Muon: normalize per output neuron (per row)
+        for (0..self.out_dim) |row| {
+            var rms: f32 = 0;
+            for (0..self.in_dim) |col| {
+                const g = self.grad[row * self.in_dim + col];
+                rms += g * g;
+            }
+            rms = @sqrt(rms / @as(f32, @floatFromInt(self.in_dim)) + EPSILON);
+
+            for (0..self.in_dim) |col| {
+                const idx = row * self.in_dim + col;
+                const g_norm = self.grad[idx] / rms;
+                self.m[idx] = MUON_MOMENTUM * self.m[idx] + g_norm;
+                self.weights[idx] -= lr * (self.m[idx] + WEIGHT_DECAY * self.weights[idx]);
+            }
         }
         @memset(self.grad, 0);
     }
@@ -627,7 +670,7 @@ fn softmaxBackward(probs: []f32, targets: []const u8, grad: []f32, n: usize) voi
     for (0..n) |i| grad[i * VOCAB_SIZE + targets[i]] -= scale;
 }
 
-const N_LAYERS: usize = 2;
+const N_LAYERS: usize = 4;
 
 const TransformerLayer = struct {
     attn_norm: RMSNorm,
