@@ -92,11 +92,16 @@ True Muon implementation (Keller Jordan, 2024) with Newton-Schulz orthogonalizat
 
 ## Generation
 
-Improved sampling for coherent text generation:
-- **Top-k Sampling (k=40)**: Only sample from top k candidates
-- **Temperature Scaling (T=0.8)**: Controls randomness
-- **Repetition Penalty (1.2x)**: Reduces repetitive outputs
-- **Periodic Samples**: Shows generation quality during training
+Greedy decoding for coherent character-level output:
+- **Greedy Decoding**: Always pick highest probability token (argmax)
+- **Repetition Penalty (1.15x)**: Mild penalty to avoid loops
+- **EMA Weights**: Uses exponential moving average weights for smoother output
+
+```
+A: Hello, how are you?
+B: It's absolutely.Thing in there's about yourself.
+A: I'm glad thinking outsides, but I'm afraid yourself.
+```
 
 ## Performance
 
