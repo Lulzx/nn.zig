@@ -112,6 +112,138 @@ fn applyDropoutBackward(grad: []f32, mask: []const f32) void {
     for (grad, mask) |*g, m| g.* *= m;
 }
 
+// Adaptive Loss Weighting: Focus gradients on hard predictions, not already-learned patterns
+// Tracks per-bigram difficulty using EMA of loss values
+const TokenDifficulty = struct {
+    ema_loss: []f32, // EMA of loss per bigram (256 * 256 = 65K entries)
+    counts: []u32, // Count of observations per bigram
+
+    pub fn init(alloc: std.mem.Allocator) !TokenDifficulty {
+        const n = 256 * 256;
+        const ema = try alloc.alloc(f32, n);
+        const cnt = try alloc.alloc(u32, n);
+        @memset(ema, 2.0); // Start assuming everything is moderately hard
+        @memset(cnt, 0);
+        return .{ .ema_loss = ema, .counts = cnt };
+    }
+
+    pub fn deinit(self: *TokenDifficulty, alloc: std.mem.Allocator) void {
+        alloc.free(self.ema_loss);
+        alloc.free(self.counts);
+    }
+
+    pub fn update(self: *TokenDifficulty, prev: u8, curr: u8, loss: f32) void {
+        const idx = @as(usize, prev) * 256 + curr;
+        const alpha: f32 = 0.01; // Slow update for stability
+        self.ema_loss[idx] = (1.0 - alpha) * self.ema_loss[idx] + alpha * loss;
+        self.counts[idx] +|= 1; // Saturating add
+    }
+
+    pub fn getWeight(self: *const TokenDifficulty, prev: u8, curr: u8) f32 {
+        const idx = @as(usize, prev) * 256 + curr;
+        // Weight by difficulty: harder patterns get more gradient
+        // Floor at 0.1 to never completely ignore anything
+        // Cap at 3.0 to prevent instability from rare patterns
+        const difficulty = self.ema_loss[idx];
+        return @max(0.1, @min(3.0, difficulty / 2.0));
+    }
+
+    pub fn getAverageWeight(self: *const TokenDifficulty) f32 {
+        var sum: f32 = 0;
+        var count: usize = 0;
+        for (0..256 * 256) |i| {
+            if (self.counts[i] > 0) {
+                sum += self.getWeight(@intCast(i / 256), @intCast(i % 256));
+                count += 1;
+            }
+        }
+        return if (count > 0) sum / @as(f32, @floatFromInt(count)) else 1.0;
+    }
+};
+
+// Weighted softmax cross-entropy: weights loss by per-bigram difficulty
+fn softmaxCEWeighted(
+    logits: []f32,
+    tokens: []const u8, // input tokens (for bigram context)
+    targets: []const u8,
+    n: usize,
+    difficulty: *TokenDifficulty,
+    training: bool,
+    smoothing: f32,
+) f32 {
+    var loss: f32 = 0;
+    var weight_sum: f32 = 0;
+    const n_classes = @as(f32, VOCAB_SIZE);
+
+    for (0..n) |i| {
+        const row = logits[i * VOCAB_SIZE ..][0..VOCAB_SIZE];
+
+        // Softmax
+        var max_v: f32 = row[0];
+        for (row) |l| max_v = @max(max_v, l);
+        var sum: f32 = 0;
+        for (row) |*l| {
+            l.* = @exp(l.* - max_v);
+            sum += l.*;
+        }
+        for (row) |*l| l.* /= sum;
+
+        // Compute token loss (with label smoothing)
+        const target_log_prob = @log(@max(row[targets[i]], 1e-10));
+        var uniform_log_prob: f32 = 0;
+        for (row) |p| uniform_log_prob += @log(@max(p, 1e-10));
+        uniform_log_prob /= n_classes;
+        const token_loss = -((1.0 - smoothing) * target_log_prob + smoothing * uniform_log_prob);
+
+        // Get weight based on how hard this bigram has been
+        const prev = if (i > 0) tokens[i - 1] else 0;
+        const weight = difficulty.getWeight(prev, targets[i]);
+
+        loss += weight * token_loss;
+        weight_sum += weight;
+
+        // Update difficulty tracker during training
+        if (training) {
+            difficulty.update(prev, targets[i], token_loss);
+        }
+    }
+
+    return loss / weight_sum;
+}
+
+// Weighted backward pass for adaptive loss
+fn softmaxBackwardWeighted(
+    probs: []f32,
+    tokens: []const u8,
+    targets: []const u8,
+    grad: []f32,
+    n: usize,
+    difficulty: *const TokenDifficulty,
+    smoothing: f32,
+) void {
+    // Compute total weight for normalization
+    var weight_sum: f32 = 0;
+    for (0..n) |i| {
+        const prev = if (i > 0) tokens[i - 1] else 0;
+        weight_sum += difficulty.getWeight(prev, targets[i]);
+    }
+
+    const uniform = smoothing / @as(f32, VOCAB_SIZE);
+
+    for (0..n) |i| {
+        const prev = if (i > 0) tokens[i - 1] else 0;
+        const weight = difficulty.getWeight(prev, targets[i]) / weight_sum;
+
+        const prob_row = probs[i * VOCAB_SIZE ..][0..VOCAB_SIZE];
+        const grad_row = grad[i * VOCAB_SIZE ..][0..VOCAB_SIZE];
+
+        for (prob_row, grad_row) |p, *g| {
+            g.* = weight * (p - uniform);
+        }
+        grad_row[targets[i]] -= weight * (1.0 - smoothing);
+    }
+}
+
 // Label smoothing: (1-ε)·target + ε·uniform
 fn softmaxCESmoothed(logits: []f32, targets: []const u8, n: usize, smoothing: f32) f32 {
     var loss: f32 = 0;
@@ -1371,10 +1503,10 @@ pub fn main() !void {
     const train_size = @as(usize, @intFromFloat(@as(f32, @floatFromInt(size)) * (1.0 - VAL_RATIO)));
     const val_size = size - train_size;
 
-    std.debug.print("Modern Transformer | ctx={d} | d={d} | RoPE + RMSNorm + SwiGLU\n", .{CONTEXT, D_MODEL});
-    std.debug.print("Train: {d:.1}MB | Val: {d:.1}MB | {d} steps | dropout={d:.1} | smooth={d:.1}\n",
+    std.debug.print("Modern Transformer | ctx={d} | d={d} | Adaptive Loss Weighting\n", .{CONTEXT, D_MODEL});
+    std.debug.print("Train: {d:.1}MB | Val: {d:.1}MB | {d} steps | dropout={d:.1} | W=bigram difficulty\n",
         .{@as(f32, @floatFromInt(train_size)) / 1e6, @as(f32, @floatFromInt(val_size)) / 1e6,
-          MAX_STEPS, DROPOUT_ATTN, LABEL_SMOOTHING});
+          MAX_STEPS, DROPOUT_ATTN});
 
     // Training buffers
     const tokens = try alloc.alloc(u8, BATCH_SIZE * CONTEXT);
@@ -1470,6 +1602,10 @@ pub fn main() !void {
     var loss_sum: f32 = 0;
     var loss_count: usize = 0;
 
+    // Adaptive loss weighting: track per-bigram difficulty
+    var difficulty = try TokenDifficulty.init(alloc);
+    defer difficulty.deinit(alloc);
+
     // Early stopping state
     var best_val_loss: f32 = std.math.inf(f32);
     var patience_counter: usize = 0;
@@ -1540,14 +1676,14 @@ pub fn main() !void {
         model.out_norm.forward(x_out[0 .. n * D_MODEL], n);
         model.out_proj.forward(x_out[0 .. n * D_MODEL], logits[0 .. n * VOCAB_SIZE], n);
 
-        // Use label smoothing for better regularization
-        const loss = softmaxCESmoothed(logits[0 .. n * VOCAB_SIZE], targets[0..n], n, LABEL_SMOOTHING);
+        // Adaptive weighted loss: focuses gradients on hard predictions
+        const loss = softmaxCEWeighted(logits[0 .. n * VOCAB_SIZE], tokens[0..n], targets[0..n], n, &difficulty, true, LABEL_SMOOTHING);
         loss_sum += loss;
         loss_count += 1;
         total_tokens += n;
 
-        // Backward pass with label smoothing
-        softmaxBackwardSmoothed(logits[0 .. n * VOCAB_SIZE], targets[0..n], logits_grad[0 .. n * VOCAB_SIZE], n, LABEL_SMOOTHING);
+        // Backward pass with adaptive weighting
+        softmaxBackwardWeighted(logits[0 .. n * VOCAB_SIZE], tokens[0..n], targets[0..n], logits_grad[0 .. n * VOCAB_SIZE], n, &difficulty, LABEL_SMOOTHING);
 
         // Output projection backward
         model.out_proj.backward(x_out[0 .. n * D_MODEL], logits_grad[0 .. n * VOCAB_SIZE], x_grad[0 .. n * D_MODEL], n);
@@ -1611,8 +1747,9 @@ pub fn main() !void {
             const elapsed = @as(f32, @floatFromInt(std.time.milliTimestamp() - start)) / 1000.0;
             const avg_loss = loss_sum / @as(f32, @floatFromInt(loss_count));
             const tps = @as(f32, @floatFromInt(total_tokens)) / elapsed;
-            std.debug.print("\x1b[2J\x1b[HStep: {d}/{d} | Train: {d:.3} | Val: {d:.3} | TPS: {d:.0}K | LR: {d:.6}\n",
-                          .{step, MAX_STEPS, avg_loss, val_loss, tps/1000, getLR(step)});
+            const avg_weight = difficulty.getAverageWeight();
+            std.debug.print("\x1b[2J\x1b[HStep: {d}/{d} | Train: {d:.3} | Val: {d:.3} | W: {d:.2} | TPS: {d:.0}K\n",
+                          .{step, MAX_STEPS, avg_loss, val_loss, avg_weight, tps/1000});
             loss_sum = 0;
             loss_count = 0;
         }

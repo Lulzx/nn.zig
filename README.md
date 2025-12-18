@@ -1,15 +1,15 @@
 # nn.zig
 
-A minimal transformer in ~1600 lines of Zig, optimized for Apple Silicon.
+A minimal transformer in ~1700 lines of Zig, optimized for Apple Silicon.
 
 ## What it does
 
-Trains a character-level language model on dialog data using modern transformer architecture with the Muon optimizer and comprehensive regularization. No frameworks, no dependencies beyond Apple's Accelerate.
+Trains a character-level language model on dialog data using modern transformer architecture with adaptive loss weighting. No frameworks, no dependencies beyond Apple's Accelerate.
 
 ```
-Step: 0     | Train: 6.39 | Val: 0.00 | TPS: 14K
-Step: 500   | Train: 2.68 | Val: 2.60 | TPS: 14K
-Sample: "Hello! How are you?"
+Step: 0     | Train: 6.40 | Val: 0.00 | W: 1.08 | TPS: 10K
+Step: 500   | Train: 2.65 | Val: 2.58 | W: 1.32 | TPS: 10K
+Sample: "Hello! How are you doing?"
 ```
 
 ## Architecture
@@ -35,6 +35,27 @@ Modern LLaMA-style architecture:
 - **SwiGLU**: Gated activation from LLaMA/PaLM (`SiLU(xW₁) ⊙ xW₂`)
 - **Causal Self-Attention**: Single-head with causal masking
 - **Gradient Clipping**: Global norm clipping for stability
+
+## Adaptive Loss Weighting
+
+A novel training approach that focuses gradients on hard predictions:
+
+**Problem**: Standard training wastes ~80% of gradient signal on already-learned patterns like "q→u" or "the→ ".
+
+**Solution**: Track per-bigram difficulty using EMA of loss values, then weight the loss inversely:
+
+```
+difficulty[prev, curr] ← EMA(loss)           # track how hard each bigram is
+weight = clamp(difficulty / 2, 0.1, 3.0)     # harder → more gradient
+loss = Σ weight[i] · cross_entropy[i]        # focus on what's hard
+```
+
+The **W** metric shows average weight over observed bigrams. As training progresses:
+- Easy patterns (common bigrams) get downweighted
+- W increases as only hard patterns remain
+- Model stops "practicing what it knows"
+
+This is implicit curriculum learning without manual scheduling.
 
 ## Muon Optimizer
 
@@ -69,7 +90,7 @@ Improved sampling for coherent text generation:
 
 | Metric | Value |
 |--------|-------|
-| Throughput | 14K tokens/sec |
+| Throughput | 10K tokens/sec |
 | Context | 64 characters |
 | Layers | 3 |
 | D_MODEL | 128 |
